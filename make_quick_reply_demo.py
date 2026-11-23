@@ -1,194 +1,186 @@
+# Regenerate the README GIFs on Windows with Pillow and Microsoft YaHei.
 from pathlib import Path
 from functools import lru_cache
-from math import sin, pi
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT / "quick-reply-demo.gif"
-W, H, S = 860, 504, 2
-MINT = "#94f3d1"
-WHITE = "#f4f8fa"
-SUBTLE = "#a4b8cd"
-STAGES = [
-    ("下拉回复", "在顶部横幅直接打开输入框", "松手，留在当前应用"),
-    ("再次下拉", "卡片拉伸、下移，松手回弹", "回复框保持展开"),
-    ("通知栏内回复", "在原位展开历史和回复框", "卡片没有拉伸和位移"),
+MEDIA = ROOT / 'docs' / 'media'
+MEDIA.mkdir(parents=True, exist_ok=True)
+W, H, S = 492, 668, 2
+SPECS = [
+    ('banner-reply.gif', '横幅下拉，即时回复', '手指到达门槛，回复框立即展开'),
+    ('shade-reply.gif', '通知栏长按回复', '长按对应通知，在卡片原位回复'),
+    ('swipe-to-dismiss.gif', '上滑收起，再滑关闭', '第一次收起内容，第二次带走整张卡片'),
 ]
-TIMES = [43, 42, 45]
-
-@lru_cache(maxsize=None)
+@lru_cache
 def font(size, bold=False):
-    return ImageFont.truetype(r"C:\Windows\Fonts" + ("\msyhbd.ttc" if bold else "\msyh.ttc"), size*S)
+    return ImageFont.truetype('C:/Windows/Fonts/' + ('msyhbd.ttc' if bold else 'msyh.ttc'), size*S)
+def scale(coords):
+    return tuple(int(round(value*S)) for value in coords)
+def rect(draw, box, radius, color, outline=None):
+    draw.rounded_rectangle(scale(box), radius*S, fill=color, outline=outline, width=S)
+def circle(draw, x, y, r, color, outline=None):
+    draw.ellipse(scale((x-r,y-r,x+r,y+r)), fill=color, outline=outline, width=S)
+def text(draw, xy, label, size, color='#14233A', bold=False, anchor=None):
+    draw.text(scale(xy), label, font=font(size,bold), fill=color, anchor=anchor)
+def line(draw, coords, color, width=1):
+    draw.line(scale(coords), fill=color, width=width*S)
+def progress(t, a, b):
+    return max(0, min(1, (t-a)/(b-a)))
+def smooth(t, a, b):
+    x = progress(t,a,b)
+    return x*x*(3-2*x)
+def mix(a,b,t):
+    return a+(b-a)*t
 
-def box(b):
-    return tuple(round(v*S) for v in b)
+SCREEN=(59,153,433,591)
+@lru_cache
+def wallpaper():
+    img=Image.new('RGB',(W*S,H*S),'#09162B')
+    draw=ImageDraw.Draw(img)
+    for y in range(H*S):
+        f=y/(H*S)
+        draw.line((0,y,W*S,y),fill=(int(11+14*f),int(23+16*f),int(43+21*f)))
+    rect(draw,(38,133,454,610),34,'#12243B', '#304767')
+    rect(draw,SCREEN,25,'#1D3B58')
+    mask=Image.new('L',img.size)
+    rect(ImageDraw.Draw(mask),SCREEN,25,255)
+    art=Image.new('RGB',img.size,'#163958')
+    a=ImageDraw.Draw(art)
+    a.ellipse(scale((130,223,560,779)),fill='#2A677D')
+    a.ellipse(scale((-160,336,385,785)),fill='#328080')
+    a.ellipse(scale((154,388,571,760)),fill='#4C9B97')
+    a.ellipse(scale((276,427,615,810)),fill='#81AAA3')
+    img.paste(art.filter(ImageFilter.GaussianBlur(12*S)),mask=mask)
+    return img
 
-def rr(d, b, r, fill, outline=None, width=1):
-    d.rounded_rectangle(box(b), radius=round(r*S), fill=fill, outline=outline, width=width*S)
+def textentry(draw,x,y,w,message):
+    rect(draw,(x,y,x+w,y+39),13,'#E6F0F4')
+    text(draw,(x+12,y+8),message,15,'#284457')
+    rect(draw,(x+w-34,y+5,x+w-5,y+34),9,'#107864')
+    line(draw,(x+w-27,y+20,x+w-12,y+14,x+w-18,y+27,x+w-20,y+21,x+w-27,y+20),'white',1)
+def notification(canvas, y, height, detail=False, entry=False, composing='', sent=False):
+    x,w = 75,342
+    layer=Image.new('RGBA',canvas.size)
+    d=ImageDraw.Draw(layer)
+    rect(d,(x+2,y+3,x+w+2,y+height+5),18,'#11233D')
+    rect(d,(x,y,x+w,y+height),18,'#F8FCFF')
+    rect(d,(x+15,y+14,x+49,y+48),11,'#107864')
+    rect(d,(x+23,y+23,x+40,y+35),5,'#F7FFFB')
+    d.polygon([scale((x+25,y+33)),scale((x+25,y+38)),scale((x+30,y+34))],fill='#F7FFFB')
+    text(d,(x+59,y+13),'阿柚',16,'#15283A',True)
+    text(d,(x+59,y+36),'周末还去看展吗？',15,'#4D6072')
+    text(d,(x+w-16,y+15),'刚刚',12,'#7A8FA1',anchor='ra')
+    if detail:
+        text(d,(x+15,y+69),'周六下午有一场，我把地点发你。',14,'#445D6E')
+    if entry:
+        textentry(d,x+14,y+100,w-28,composing)
+    if sent:
+        rect(d,(x+111,y+98,x+w-15,y+136),12,'#D8F6EA')
+        text(d,(x+w-25,y+106),'我  好呀，周六见！',14,'#136851',anchor='ra')
+    mask=Image.new('L',canvas.size)
+    rect(ImageDraw.Draw(mask),(x,y,x+w,y+height),18,255)
+    canvas.paste(layer,mask=mask)
 
-def line(d, pts, color, width=1):
-    d.line([(round(x*S), round(y*S)) for x,y in pts], fill=color, width=width*S)
+def touch(draw, x,y, strength=1.0, trail=0):
+    if trail:
+        line(draw,(x,y+trail,x,y),'#42BFA9',2)
+    circle(draw,x,y,13+3*strength,'#0D796D','#E2FFFA')
+    circle(draw,x,y,5,'#DBFFF6')
+def shade(draw):
+    rect(draw,(59,153,433,591),25,'#20364E')
+    text(draw,(80,185),'通知',22,'#F2F8FF',True)
+    text(draw,(404,190),'周六',14,'#B8D4E6',anchor='ra')
+    for i in range(4):
+        x=80+i*86
+        rect(draw,(x,225,x+75,271),15,'#365671' if i>=2 else '#23776B')
+        text(draw,(x+37,248),('网络','声音','蓝牙','亮度')[i],14,'#F3FBFF',anchor='mm')
+def keyboard(draw,y):
+    rect(draw,(60,y,432,590),20,'#C2D5E3')
+    for iy,row in enumerate(('QWERTYUIOP','ASDFGHJKL','ZXCVBNM')):
+        x0=72+(10-len(row))*17
+        for ix,letter in enumerate(row):
+            x=x0+ix*34
+            rect(draw,(x,y+10+iy*35,x+29,y+38+iy*35),7,'#E9F4FA')
+            text(draw,(x+14,y+24+iy*35),letter,12,'#36536A',anchor='mm')
+    rect(draw,(139,y+119,351,y+143),8,'#E9F4FA')
+    text(draw,(245,y+130),'空格',11,'#36536A',anchor='mm')
 
-def tx(d, x, y, s, size, color=WHITE, bold=False, anchor="lt"):
-    d.text((round(x*S),round(y*S)), s, font=font(size,bold), fill=color, anchor=anchor)
-
-def ellipse(d, b, color, outline=None, width=1):
-    d.ellipse(box(b), fill=color, outline=outline, width=width*S)
-
-def clamp(x):
-    return min(1,max(0,x))
-
-def step(t, a, b):
-    k = clamp((t-a)/(b-a))
-    return k*k*(3-2*k)
-
-def lerp(a,b,p):
-    return a+(b-a)*p
-
-def mix(a,b,p):
-    a,b = bytes.fromhex(a[1:]),bytes.fromhex(b[1:])
-    return tuple(round(lerp(x,y,p)) for x,y in zip(a,b))
-
-bg = Image.new("RGB", (W*S,H*S)); bd = ImageDraw.Draw(bg)
-for y in range(H):
-    bd.rectangle(box((0,y,W,y+1)), fill=mix("#112139","#071421",y/H))
-rr(bd,(461,25,801,479),38,"#07121e","#35495c",1)
-rr(bd,(468,32,794,472),31,"#152c43")
-rr(bd,(603,39,659,50),5,"#091522")
-line(bd,[(611,461),(652,461)],"#8293a4",3)
-tx(bd,489,52,"09:41",12,WHITE,True)
-tx(bd,775,51,"▂▅  ▰",11,WHITE,False,"rt")
-
-def home(d):
-    for i,(x,y) in enumerate([(489,184),(620,184),(489,264),(620,264),(489,345),(620,345)]):
-        rr(d,(x,y,x+151,y+66),14,["#1e3d54","#234352","#203b52"][i%3])
-        rr(d,(x+12,y+14,x+36,y+38),6,"#36566c")
-        rr(d,(x+47,y+18,x+122,y+24),3,"#688299")
-        rr(d,(x+47,y+33,x+98,y+37),2,"#4b657d")
-
-def quicksettings(d, height):
-    if height <= 0:
-        return
-    layer = Image.new("RGB",(326*S,413*S),"#1b2c42")
-    ld=ImageDraw.Draw(layer)
-    for y in range(413):
-        ld.rectangle(box((0,y,326,y+1)),fill=mix("#263d54","#14263a",y/413))
-    tx(ld,18,17,"通知中心",20,WHITE,True)
-    tx(ld,306,26,"周日",12,SUBTLE,False,"rt")
-    for i,label in enumerate(["网络","蓝牙","静音"]):
-        x=18+i*100
-        rr(ld,(x,56,x+89,93),12,("#498479" if i==0 else "#344b63"))
-        tx(ld,x+45,75,label,12,WHITE,False,"mm")
-    rr(ld,(18,109,306,118),5,"#3d5369")
-    rr(ld,(18,109,139,118),5,"#8bdfc6")
-    rr(ld,(18,302,306,359),12,"#253d54")
-    tx(ld,32,316,"日历",12,WHITE,True)
-    tx(ld,32,335,"明天有一项日程",12,SUBTLE)
-    return layer.crop((0,0,326*S,round(height)*S))
-
-def message(d,x,y,w,h,reveal,shade,stretch=0):
-    rr(d,(x,y+4,x+w,y+h+5),18,"#102034")
-    rr(d,(x,y,x+w,y+h),17,mix("#304c65","#2a425b",shade),
-       mix("#709aaa","#5d9d95",shade))
-    rr(d,(x+11,y+14,x+42,y+45),8,"#73e7c5")
-    rr(d,(x+19,y+23,x+34,y+33),4,"#173e45")
-    ellipse(d,(x+20,y+29,x+24,y+34),"#173e45")
-    tx(d,x+51,y+13,"小林",13,WHITE,True)
-    tx(d,x+w-12,y+15,"刚刚",10,SUBTLE,False,"rt")
-    tx(d,x+51,y+35+stretch*2,"周末去看展吗？",14,WHITE)
-    if reveal > 0:
-        textshift=(1-reveal)*9
-        c=mix("#304c65",SUBTLE,reveal)
-        tx(d,x+51,y+60+stretch*5+textshift,"上一条：展览到周日结束",10,c)
-        if reveal > .2:
-            ry=y+82+stretch*6+textshift
-            rr(d,(x+12,ry,x+w-12,ry+31),11,mix("#39536b","#172d42",reveal))
-            tx(d,x+24,ry+9,"快速回复…",12,mix("#405970","#bed0dd",reveal))
-            ellipse(d,(x+w-40,ry+5,x+w-19,ry+26),mix("#445d72",MINT,reveal))
-            line(d,[(x+w-33,ry+17),(x+w-27,ry+11),(x+w-26,ry+17)],"#214953",2)
-
-def frame(stage,t):
-    im=bg.copy()
-    d=ImageDraw.Draw(im)
-    rr(d,(48,55,69,77),6,MINT)
-    rr(d,(54,61,63,68),2,"#214b48")
-    ellipse(d,(54,66,57,70),"#214b48")
-    tx(d,81,57,"通知快捷回复",15,WHITE,True)
-    tx(d,47,111,STAGES[stage][0],36,WHITE,True)
-    tx(d,49,176,STAGES[stage][1],18,WHITE)
-    tx(d,49,210,STAGES[stage][2],16,SUBTLE)
-    for i, label in enumerate(("下拉","再拉","通知栏")):
-        x=48+i*92
-        active=i==stage
-        rr(d,(x,391,x+79,425),12,"#163e43" if active else "#13263a",
-           "#5ab99f" if active else "#30475e")
-        tx(d,x+39,408,label,13,MINT if active else SUBTLE,active,"mm")
-    tx(d,49,449,"COLOROS 17  /  手势动效示意",10,SUBTLE)
-
-    home(d)
-    y=79
-    amount=0
-    reve=0
-    shade=0
-    touch=0
-    cy=115
-    if stage==0:
-        move=step(t,.13,.44)
-        spring=1-step(t,.48,.66)
-        amount=.76*step(t,.29,.48)*spring
-        reve=step(t,.37,.61)
-        touch=step(t,.08,.15)*(1-step(t,.49,.54))
-        cy=114+45*move
-    elif stage==1:
-        move=step(t,.16,.57)
-        amount=move*(1-step(t,.57,.88))
-        reve=1
-        touch=step(t,.1,.19)*(1-step(t,.57,.64))
-        cy=114+57*move
+def frame(kind,t):
+    img=wallpaper().copy()
+    d=ImageDraw.Draw(img)
+    title,subtitle=SPECS[kind][1:]
+    text(d,(37,24),'ShadeReply',18,'#84E5CE',True)
+    text(d,(455,28),'手势示意',13,'#A6BED2',anchor='ra')
+    text(d,(36,57),title,34,'#F4F8FF',True)
+    text(d,(38,109),subtitle,15,'#B9D2E1')
+    d=ImageDraw.Draw(img)
+    text(d,(79,166),'10:42',12,'#EDF8FF',True)
+    text(d,(412,166),'5G  ▪',12,'#EDF8FF',anchor='ra')
+    phase=''
+    if kind==0:
+        expand=smooth(t,.18,.39)
+        y=191+mix(0,23,smooth(t,.15,.34))-23*smooth(t,.34,.46)
+        sent=t>=.81
+        if .45 <= t < .81: keyboard(d,440)
+        message='好呀，周六见！'
+        typed=message[:round(len(message)*progress(t,.51,.73))]
+        notification(img,y,round(mix(69,153,expand)),expand>.10,expand>.35 and not sent,typed or '输入回复内容',sent)
+        if .14<t<.44:
+            touch(ImageDraw.Draw(img),259,222+73*smooth(t,.14,.38),trail=-23*expand)
+        elif .76<t<.82:
+            touch(ImageDraw.Draw(img),388,y+119,.5)
+        phase='下拉横幅' if t<.29 else ('到达门槛，打开回复框' if t<.81 else '回复显示在通知里')
+    elif kind==1:
+        shade(d)
+        expand=smooth(t,.33,.49)
+        if t>=.50: keyboard(d,440)
+        notification(img,293,round(mix(70,145,expand)),expand>.10,expand>.40,'输入回复内容')
+        if .13<t<.43:
+            hold=progress(t,.13,.38)
+            d=ImageDraw.Draw(img)
+            if hold>0.04:
+                d.arc(scale((282,305,327,350)),-90,-90+360*hold,fill='#107864',width=3*S)
+            touch(d,304,328,hold)
+        phase='在通知栏找到消息' if t<.15 else ('长按通知卡片' if t<.40 else '在原位打开回复框')
     else:
-        shade=1
-        y=208
-        reve=step(t,.38,.63)
-        move=step(t,.14,.47)
-        touch=step(t,.11,.17)*(1-step(t,.47,.53))
-        cy=240+31*move
+        collapse=smooth(t,.13,.40)
+        dismiss=smooth(t,.58,.76)
+        exit=smooth(t,.76,.85)
+        scene=wallpaper().crop(scale(SCREEN))
+        blur=scene.filter(ImageFilter.GaussianBlur((8*(1-collapse))*S))
+        img.paste(blur,scale(SCREEN)[:2])
+        d=ImageDraw.Draw(img)
+        text(d,(79,166),'10:42',12,'#EDF8FF',True)
+        text(d,(412,166),'5G  ▪',12,'#EDF8FF',anchor='ra')
+        if t<.85:
+            layer=img.copy()
+            notification(layer,204-45*dismiss-160*exit,round(mix(153,69,collapse)),True,True,'输入回复内容')
+            blur_screen=layer.crop(scale((59,153,433,591)))
+            img.paste(blur_screen,scale(SCREEN)[:2])
+        if .13<t<.41:
+            touch(ImageDraw.Draw(img),270,340-100*collapse,trail=22*collapse)
+        if .56<t<.77:
+            touch(ImageDraw.Draw(img),271,244-62*dismiss,trail=22*dismiss)
+        phase='第一次上滑 · 收起内容和模糊' if t<.42 else ('松手后 · 横幅保持紧凑' if t<.56 else ('第二次上滑 · 卡片跟手上移' if t<.77 else '越过门槛后松手关闭'))
+    d=ImageDraw.Draw(img)
+    rect(d,(37,625,455,653),12,'#1B3A4B')
+    text(d,(246,639),phase,13,'#C9F5EB',True,anchor='mm')
+    return img.resize((W,H),Image.Resampling.LANCZOS)
 
-    if shade > 0:
-        layer=quicksettings(d,413*shade)
-        if layer:
-            im.paste(layer,(468*S,58*S))
-        d=ImageDraw.Draw(im)
-        if shade > .66:
-            line(d,[(611,461),(652,461)],"#8293a4",3)
-    y += amount*22
-    if reve == 0:
-        h=65+amount*10
-    else:
-        h=max(65,124*reve+16*(1-reve))+amount*13
-    x=486+amount*5
-    w=290-amount*10
-    # Draw reveal controls into the card as their height becomes available.
-    visible_reveal = reve if h >= 115+amount*8 else 0
-    message(d,x,y,w,h,visible_reveal,shade,amount)
-    if touch>.05:
-        c=mix("#508d90",MINT,touch)
-        ellipse(d,(627-13,cy-13,627+13,cy+13),None,c,2)
-        ellipse(d,(623,cy-4,631,cy+4),c)
-    return im.resize((W,H),Image.Resampling.LANCZOS)
-
-frames=[]
-durations=[]
-for stage,n in enumerate(TIMES):
-    for i in range(n):
-        frames.append(frame(stage,i/(n-1)))
-        durations.append(55 if i!=n-1 else 460)
-samples=Image.new("RGB",(W*3,H))
-for stage, time in enumerate([.68,.51,.83]):
-    samples.paste(frame(stage,time),(stage*W,0))
-palette=samples.quantize(colors=256,method=Image.Quantize.MEDIANCUT)
-frames=[f.quantize(palette=palette,dither=Image.Dither.NONE) for f in frames]
-frames[0].save(OUT,save_all=True,append_images=frames[1:],duration=durations,loop=0,optimize=True)
-samples.resize((W*3//2,H//2),Image.Resampling.LANCZOS).save(ROOT.parent/"quick-reply-review.png")
-with Image.open(OUT) as gif:
-    assert gif.size == (W,H) and gif.n_frames >= 70 and gif.info["loop"] == 0
-    print(f"{gif.size[0]}x{gif.size[1]}, {gif.n_frames} frames, {OUT.stat().st_size:,} bytes")
+for i,(name,_,_) in enumerate(SPECS):
+    images=[frame(i,j/60) for j in range(61)]
+    samples=[images[j] for j in (0,14,26,39,50,60)]
+    palette=Image.new('RGB',(W*3,H*2))
+    for j,image in enumerate(samples):
+        palette.paste(image,((j%3)*W,(j//3)*H))
+    palette=palette.quantize(colors=112)
+    frames=[image.quantize(palette=palette,dither=Image.Dither.NONE) for image in images]
+    durations=[55]*len(frames)
+    durations[0]=310
+    durations[-1]=1000
+    path=MEDIA/name
+    frames[0].save(path,save_all=True,append_images=frames[1:],duration=durations,loop=0,optimize=True,disposal=1)
+    with Image.open(path) as result:
+        result.seek(result.n_frames-1)
+        print(name,result.size,result.n_frames,path.stat().st_size)

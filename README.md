@@ -4,7 +4,9 @@
 
 [下载发布版 APK](https://github.com/Xinhuaaa/shadereply/releases)
 
-![通知快捷回复手势演示](quick-reply-demo.gif)
+| 横幅下拉回复 | 通知栏长按回复 | 上滑收起与关闭 |
+| --- | --- | --- |
+| <img src="docs/media/banner-reply.gif" width="246" alt="下拉顶部横幅打开回复框"> | <img src="docs/media/shade-reply.gif" width="246" alt="长按通知栏里的消息打开回复框"> | <img src="docs/media/swipe-to-dismiss.gif" width="246" alt="第一次上滑收起横幅，第二次上滑关闭"> |
 
 *动效示意，界面和消息内容为演示素材。*
 
