@@ -53,11 +53,12 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
         radius = Math.min(48, Math.round(12 * window.getResources().getDisplayMetrics().density));
     }
 
-    void startDrag(View row) {
+    float startDrag(View row) {
         stopWatchingView();
         stopAnimation();
         watchedView = row;
         if (row != window) row.addOnAttachStateChangeListener(this);
+        return progress;
     }
 
     void drag(float fraction) {

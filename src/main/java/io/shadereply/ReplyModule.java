@@ -38,6 +38,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 public final class ReplyModule extends XposedModule {
     private static final String TAG = "WeChatShadeReply";
@@ -55,6 +57,8 @@ public final class ReplyModule extends XposedModule {
     private final WeakHashMap<Object, NotificationGesture> bannerGestures = new WeakHashMap<>();
     private final WeakHashMap<View, BannerHeightPreview> bannerPreviews = new WeakHashMap<>();
     private final WeakHashMap<View, OpenReplyPull> openReplyPulls = new WeakHashMap<>();
+    private final WeakHashMap<View, BannerSwipeUp> bannerSwipes = new WeakHashMap<>();
+    private final WeakHashMap<View, String> compactSwipeKeys = new WeakHashMap<>();
     private boolean replayingOpenReplyDown;
     private NotificationGesture shadeGesture;
     private Class<?> rowType;
@@ -63,7 +67,9 @@ public final class ReplyModule extends XposedModule {
             isPinned, notifyHeightChanged, isShowingExpanded;
     private Field privateRow, headsUpEditor, editorText, stackController, stackView, stackExpanded, statusBarState;
     private Field expandedWhenPinned;
-    private Method getActualHeight, getMaxContentHeight, setActualHeight, setSwipingToExpand, isGroupSummary;
+    private Method getActualHeight, getMaxContentHeight, getHeadsUpHeight, setActualHeight,
+            setSwipingToExpand, isGroupSummary, removeHeadsUp;
+    private Field rowHeadsUpManager;
     private Field swipingToExpand;
     private HeadsUpTimeout headsUpTimeout;
     private Object panel, remoteInputManager;
@@ -92,6 +98,8 @@ public final class ReplyModule extends XposedModule {
         PullDeformation deformation;
         BannerHeightPreview bannerPreview;
         ReplyBackdrop backdrop;
+        BannerSwipeUp swipeUp;
+        float peakY;
 
         NotificationGesture(Candidate target, MotionEvent down, GestureConfig settings, int pullDp) {
             this(target.row(), target.notification().getKey(), down, settings, pullDp);
@@ -102,6 +110,7 @@ public final class ReplyModule extends XposedModule {
             this.key = key;
             this.x = down.getRawX();
             this.y = down.getRawY();
+            this.peakY = this.y;
             this.downTime = down.getDownTime();
             this.pullEnabled = settings.pull();
             this.holdMs = settings.hold() ? settings.holdMs() : 0;
@@ -187,12 +196,37 @@ public final class ReplyModule extends XposedModule {
         }
 
         void endMotion() {
+            if (swipeUp != null) {
+                swipeUp.release(true);
+                swipeUp = null;
+            }
             if (bannerPreview != null) bannerPreview.finish(handled);
             if (deformation != null) deformation.release();
             if (!handled && backdrop != null) backdrop.collapse();
             bannerPreview = null;
             deformation = null;
             backdrop = null;
+        }
+
+        boolean followsSwipeUp(MotionEvent event) {
+            if (event.getPointerCount() != 1) return false;
+            peakY = Math.max(peakY, event.getRawY());
+            if (!handled || pullCancelled) return false;
+            float up = peakY - event.getRawY();
+            return up >= slop && up > Math.abs(event.getRawX() - x) * 1.55f;
+        }
+
+        boolean handleSwipeUp(MotionEvent event) {
+            if (swipeUp == null) return false;
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
+                swipeUp.follow(peakY - event.getRawY() - slop);
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
+                    || action == MotionEvent.ACTION_POINTER_DOWN) {
+                swipeUp.release(action != MotionEvent.ACTION_UP);
+                swipeUp = null;
+            }
+            return true;
         }
     }
 
@@ -301,6 +335,10 @@ public final class ReplyModule extends XposedModule {
             isPinned = method(rowType, "isPinned");
             notifyHeightChanged = method(rowType, "notifyHeightChanged", String.class, boolean.class);
             expandedWhenPinned = field(rowType, "mExpandedWhenPinned");
+            getHeadsUpHeight = method(rowType, "getHeadsUpHeight");
+            rowHeadsUpManager = field(rowType, "mHeadsUpManager");
+            removeHeadsUp = method(rowHeadsUpManager.getType(), "removeNotification",
+                    String.class, boolean.class, String.class);
         } catch (ReflectiveOperationException | RuntimeException error) {
             log(Log.WARN, TAG, "Banner expansion unavailable", error);
         }
@@ -337,8 +375,8 @@ public final class ReplyModule extends XposedModule {
         OpenReplyDrag find(View window, MotionEvent down) throws ReflectiveOperationException;
     }
 
-    private record OpenReplyDrag(View surface, View card) {
-        private static final OpenReplyDrag KEEP_EDITOR_OPEN = new OpenReplyDrag(null, null);
+    private record OpenReplyDrag(View surface, View card, BannerSwipeUp swipeUp) {
+        private static final OpenReplyDrag KEEP_EDITOR_OPEN = new OpenReplyDrag(null, null, null);
     }
 
     private final class OpenReplyPull implements View.OnAttachStateChangeListener {
@@ -349,6 +387,7 @@ public final class ReplyModule extends XposedModule {
         final Runnable releaseToNative = this::replayDown;
         MotionEvent down;
         PullDeformation deformation;
+        boolean swipingUp;
 
         OpenReplyPull(View window, MotionEvent event, OpenReplyDrag target) {
             this.window = window;
@@ -365,23 +404,36 @@ public final class ReplyModule extends XposedModule {
             int action = event.getActionMasked();
             float dx = Math.abs(event.getRawX() - x);
             float dy = event.getRawY() - y;
-            boolean pulling = event.getPointerCount() == 1 && dy > dx * 1.55f;
+            boolean pulling = config.pull() && target.card() != null
+                    && event.getPointerCount() == 1 && dy > dx * 1.55f;
             if (down != null) {
-                if (action == MotionEvent.ACTION_MOVE && pulling && dy >= slop) {
+                boolean upward = target.swipeUp() != null && event.getPointerCount() == 1
+                        && -dy >= slop && -dy > dx * 1.55f;
+                if (action == MotionEvent.ACTION_MOVE && (upward || pulling && dy >= slop)) {
                     // ColorOS must not get any part of this drag, including a synthetic CANCEL.
+                    swipingUp = upward;
                     discardDown();
                 } else if (action == MotionEvent.ACTION_CANCEL) {
                     finish();
                     return true;
                 } else if (action != MotionEvent.ACTION_MOVE || event.getPointerCount() != 1
-                        || dy < -slop || (dx > slop && dx >= dy)) {
+                        || Math.abs(dy) >= slop || (dx > slop && dx >= dy)) {
                     replayDown();
                     return false;
                 } else {
                     return true;
                 }
             }
-            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            if (swipingUp) {
+                if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
+                    target.swipeUp().follow(-dy - slop);
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
+                        || action == MotionEvent.ACTION_POINTER_DOWN) {
+                    target.swipeUp().release(action != MotionEvent.ACTION_UP);
+                    swipingUp = false;
+                    finish();
+                }
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                 finish();
             } else if (action == MotionEvent.ACTION_MOVE && event.getPointerCount() == 1
                     && target.surface() != null) {
@@ -419,6 +471,8 @@ public final class ReplyModule extends XposedModule {
             openReplyPulls.remove(window);
             window.removeOnAttachStateChangeListener(this);
             if (deformation != null) deformation.release();
+            if (swipingUp) target.swipeUp().release(true);
+            swipingUp = false;
         }
 
         @Override public void onViewAttachedToWindow(View view) {}
@@ -431,10 +485,11 @@ public final class ReplyModule extends XposedModule {
         if (event.getActionMasked() != MotionEvent.ACTION_DOWN)
             return pull != null && pull.handle(event);
         if (pull != null) pull.finish();
-        if (!config.pull() || event.getPointerCount() != 1 || !unlocked(window)) return false;
+        if (event.getPointerCount() != 1 || !unlocked(window)) return false;
         guarded(() -> {
             OpenReplyDrag drag = target.find(window, event);
-            if (drag != null) openReplyPulls.put(window, new OpenReplyPull(window, event, drag));
+            if (drag != null && (config.pull() || drag.swipeUp() != null))
+                openReplyPulls.put(window, new OpenReplyPull(window, event, drag));
         });
         return openReplyPulls.containsKey(window);
     }
@@ -470,8 +525,213 @@ public final class ReplyModule extends XposedModule {
             throws ReflectiveOperationException {
         if (!touches(row, down) || privateRow.getBoolean(row)) return null;
         View editor = activeEditor(row);
-        if (editor == null || touches(editor, down)) return null;
-        return animate ? new OpenReplyDrag(row, row) : OpenReplyDrag.KEEP_EDITOR_OPEN;
+        if (editor != null && touches(editor, down)) return null;
+        if (!animate) return editor == null ? null : OpenReplyDrag.KEEP_EDITOR_OPEN;
+        BannerSwipeUp swipe = rowSwipeUp(row, true);
+        return editor == null
+                ? (swipe == null ? null : new OpenReplyDrag(null, null, swipe))
+                : new OpenReplyDrag(row, row, swipe);
+    }
+
+    private BannerSwipeUp rowSwipeUp(View row, boolean allowCompact) throws ReflectiveOperationException {
+        if (getHeadsUpHeight == null || removeHeadsUp == null || getActualHeight == null
+                || !(boolean) isHeadsUp.invoke(row) || !(boolean) isPinned.invoke(row)) return null;
+        Candidate target = bannerCandidate(row, null);
+        if (target == null) return null;
+        View editor = activeEditor(row);
+        boolean expanded = expandedWhenPinned.getBoolean(row) || editor != null;
+        String key = target.notification().getKey();
+        if (!expanded && (!allowCompact || !key.equals(compactSwipeKeys.get(row)))) return null;
+        int height = (int) getActualHeight.invoke(row);
+        int compact = expanded ? Math.min(height, (int) getHeadsUpHeight.invoke(row)) : height;
+        Object manager = rowHeadsUpManager.get(row);
+        if (manager == null) return null;
+        BooleanSupplier current = () -> {
+            try {
+                if (!row.isShown() || privateRow.getBoolean(row) || !(boolean) isHeadsUp.invoke(row)) return false;
+                Object entry = getEntry.invoke(row);
+                return entry != null && getSbn.invoke(entry) instanceof StatusBarNotification notification
+                        && key.equals(notification.getKey());
+            } catch (ReflectiveOperationException | RuntimeException error) {
+                warn(error);
+                return false;
+            }
+        };
+        return newBannerSwipe(row, editor, height, compact, expanded, current, () -> {
+            ++requestId;
+            if (editor != null && (boolean) isEditorActive.invoke(editor)) closeBannerEditor(editor);
+            if (expandedWhenPinned.getBoolean(row)) {
+                expandedWhenPinned.setBoolean(row, false);
+                setActualHeight.invoke(row, compact, true);
+                notifyHeightChanged.invoke(row, "ShadeReply collapse pinned banner", false);
+            }
+            compactSwipeKeys.put(row, key);
+        }, () -> {
+            compactSwipeKeys.remove(row);
+            removeHeadsUp.invoke(manager, key, true, "ShadeReply swipe up");
+        },
+                backdrop -> { if (editor != null) watchEditorBackdrop(backdrop, editor); });
+    }
+
+    private BannerSwipeUp newBannerSwipe(View card, View editor, int height, int compact, boolean expanded,
+            BooleanSupplier current, CheckedAction collapse, CheckedAction dismiss,
+            Consumer<ReplyBackdrop> restoreBlur) {
+        if (height <= 0 || compact <= 0) return null;
+        return new BannerSwipeUp(card, editor, height, Math.min(compact, height), expanded, current,
+                collapse, dismiss, restoreBlur);
+    }
+
+    private void trackSwipe(View card, BannerSwipeUp swipe) {
+        BannerSwipeUp previous = bannerSwipes.get(card);
+        if (previous != swipe) {
+            if (previous != null) previous.restore();
+            bannerSwipes.put(card, swipe);
+        }
+    }
+
+    private final class BannerSwipeUp implements View.OnAttachStateChangeListener {
+        private final View card, editor;
+        private final int expanded, compact;
+        private final float collapseDistance, dismissDistance;
+        private final BooleanSupplier current;
+        private final CheckedAction collapse, dismiss;
+        private final Consumer<ReplyBackdrop> restoreBlur;
+        private Rect originalClip;
+        private final Rect swipeClip = new Rect();
+        private float originalTranslation, offset, editorAlpha, blurProgress, distance, exitDistance;
+        private ReplyBackdrop backdrop;
+        private ValueAnimator settle;
+        private boolean started, finished;
+
+        BannerSwipeUp(View card, View editor, int expanded, int compact, boolean startsExpanded, BooleanSupplier current,
+                CheckedAction collapse, CheckedAction dismiss, Consumer<ReplyBackdrop> restoreBlur) {
+            this.card = card;
+            this.editor = editor;
+            this.expanded = expanded;
+            this.compact = compact;
+            this.current = current;
+            this.collapse = collapse;
+            this.dismiss = dismiss;
+            this.restoreBlur = restoreBlur;
+            float density = card.getResources().getDisplayMetrics().density;
+            collapseDistance = startsExpanded ? Math.max(28f * density, Math.min(72f * density, expanded - compact)) : 0f;
+            dismissDistance = Math.max(34f * density, Math.min(64f * density, compact * 0.48f));
+        }
+
+        void follow(float up) {
+            if (finished) return;
+            if (!current.getAsBoolean()) {
+                restore();
+                return;
+            }
+            if (!started) start();
+            render(Math.max(0f, up));
+        }
+
+        private void start() {
+            trackSwipe(card, this);
+            started = true;
+            originalClip = card.getClipBounds();
+            originalTranslation = card.getTranslationY();
+            if (editor != null) {
+                ReplyReveal.cancel(editor);
+                editorAlpha = editor.getAlpha();
+            }
+            int[] bounds = new int[2];
+            card.getLocationOnScreen(bounds);
+            exitDistance = Math.max(dismissDistance, bounds[1] + compact + 8f);
+            backdrop = collapseDistance > 0f ? ReplyBackdrop.forView(card) : null;
+            if (backdrop != null) blurProgress = backdrop.startDrag(card);
+            card.addOnAttachStateChangeListener(this);
+        }
+
+        private void render(float up) {
+            distance = up;
+            float collapsed = collapseDistance > 0f ? Math.min(1f, up / collapseDistance) : 1f;
+            if (expanded > compact) {
+                if (originalClip == null) swipeClip.set(0, 0, card.getWidth(), expanded);
+                else swipeClip.set(originalClip);
+                swipeClip.bottom = Math.max(swipeClip.top, Math.min(swipeClip.bottom,
+                        Math.round(expanded + (compact - expanded) * collapsed)));
+                card.setClipBounds(swipeClip);
+            }
+            if (editor != null && editor != card) editor.setAlpha(editorAlpha * (1f - collapsed));
+            if (backdrop != null) backdrop.drag(blurProgress * (1f - collapsed));
+
+            // Account for SystemUI moving the row while the keyboard is changing its insets.
+            float translation = card.getTranslationY();
+            if (translation != originalTranslation - offset) originalTranslation = translation;
+            offset = Math.min(exitDistance, Math.max(0f, up - collapseDistance));
+            card.setTranslationY(originalTranslation - offset);
+        }
+
+        void release(boolean cancelled) {
+            if (!started || finished || settle != null) return;
+            boolean dismissCard = !cancelled && offset >= dismissDistance;
+            boolean close = !cancelled && collapseDistance > 0f && distance >= collapseDistance * 0.5f;
+            float target = dismissCard ? collapseDistance + exitDistance : close ? collapseDistance : 0f;
+            if (distance == target || !ValueAnimator.areAnimatorsEnabled()) {
+                complete(target, close, dismissCard);
+                return;
+            }
+            settle = ValueAnimator.ofFloat(distance, target);
+            settle.setDuration(dismissCard ? 180 : 210);
+            settle.setInterpolator(new PathInterpolator(0.20f, 0.68f, 0.24f, 1f));
+            settle.addUpdateListener(animation -> {
+                if (current.getAsBoolean()) render((float) animation.getAnimatedValue());
+                else restore();
+            });
+            settle.addListener(new AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(Animator animation) {
+                    settle = null;
+                    complete(target, close, dismissCard);
+                }
+            });
+            settle.start();
+        }
+
+        private void complete(float target, boolean close, boolean dismissCard) {
+            if (finished) return;
+            if (!current.getAsBoolean()) {
+                restore();
+                return;
+            }
+            render(target);
+            if (close) guarded(collapse);
+            if (dismissCard) {
+                guarded(dismiss);
+                // Native removal may keep the detached or recycled row around until its animation ends.
+                if (!finished) main.postDelayed(this::restore, 400);
+            } else if (close) {
+                card.postOnAnimation(this::restore);
+            } else {
+                restore();
+            }
+        }
+
+        void restore() {
+            if (finished) return;
+            finished = true;
+            if (bannerSwipes.get(card) == this) bannerSwipes.remove(card);
+            if (!started) return;
+            if (settle != null) {
+                settle.removeAllListeners();
+                settle.removeAllUpdateListeners();
+                settle.cancel();
+                settle = null;
+            }
+            card.removeOnAttachStateChangeListener(this);
+            card.setClipBounds(originalClip);
+            if (card.getTranslationY() == originalTranslation - offset) card.setTranslationY(originalTranslation);
+            if (editor != null && editor != card) editor.setAlpha(editorAlpha);
+            if (backdrop != null) {
+                if (distance == 0f && current.getAsBoolean() && editor != null) restoreBlur.accept(backdrop);
+                else backdrop.collapse();
+            }
+        }
+
+        @Override public void onViewAttachedToWindow(View view) {}
+        @Override public void onViewDetachedFromWindow(View view) { restore(); }
     }
 
     private void observeConfig(Context context) {
@@ -516,11 +776,12 @@ public final class ReplyModule extends XposedModule {
         private final Field bannerView, touchHandler, currentEntry, bannerHelper, replyLayout, replyEditor, bannerText;
         private final Field nativeIntent, nativeInput, buttons, wrapperTarget, clickOwner, clickContext, clickInput;
         private final Field displayHandler, dialogNotification;
-        private final Method closeRemoteInputs;
+        private final Method closeRemoteInputs, hideBannerImmediately;
         private final Class<?> wrapperType, clickType;
         private FullScreenAction action;
         private NotificationGesture gesture;
         private ViewGroup touchedContainer;
+        private final WeakHashMap<View, Integer> compactHeights = new WeakHashMap<>();
 
         FullScreenReply(ClassLoader loader, Class<?> entryType) throws ReflectiveOperationException {
             String prefix = "com.oplus.systemui.notification.interruption.fullscreenbanner.";
@@ -541,6 +802,7 @@ public final class ReplyModule extends XposedModule {
             nativeIntent = field(helper, "mPendingIntent");
             nativeInput = field(helper, "mRemoteInput");
             closeRemoteInputs = method(helper, "closeRemoteInputs");
+            hideBannerImmediately = method(helper, "hideBannerImmediately");
             displayHandler = field(helper, "mHandler");
             dialogNotification = field(helper, "mHasDialogNotification");
             buttons = field(builder, "mBtnMap");
@@ -613,10 +875,14 @@ public final class ReplyModule extends XposedModule {
         private Object dispatch(Chain chain) throws Throwable {
             ViewGroup container = (ViewGroup) chain.getThisObject();
             MotionEvent event = (MotionEvent) chain.getArg(0);
-            if (handleOpenReplyPull(container, event, (window, down) ->
-                    bannerView.get(window) instanceof View banner && touches(banner, down)
-                            && replyLayout.get(banner) instanceof View holder && holder.isShown()
-                            && !touches(holder, down) ? new OpenReplyDrag(window, banner) : null)) return true;
+            if (handleOpenReplyPull(container, event, (window, down) -> {
+                if (!(bannerView.get(window) instanceof View banner) || !touches(banner, down)
+                        || !(replyLayout.get(banner) instanceof View holder)) return null;
+                if (holder.isShown() && touches(holder, down)) return null;
+                BannerSwipeUp swipe = fullScreenSwipeUp(container, banner, holder);
+                return holder.isShown() ? new OpenReplyDrag(window, banner, swipe)
+                        : (swipe == null ? null : new OpenReplyDrag(null, null, swipe));
+            })) return true;
             int type = event.getActionMasked();
             if (type == MotionEvent.ACTION_DOWN) {
                 clear();
@@ -625,6 +891,22 @@ public final class ReplyModule extends XposedModule {
             }
             NotificationGesture current = gesture;
             if (current == null || touchedContainer != container) return chain.proceed();
+            if (type == MotionEvent.ACTION_MOVE && current.swipeUp == null && current.followsSwipeUp(event)) {
+                guarded(() -> {
+                    if (replyLayout.get(current.row) instanceof View holder && holder.isShown()) {
+                        current.swipeUp = fullScreenSwipeUp(container, current.row, holder);
+                    }
+                });
+                if (current.swipeUp != null && !current.cancelledNativeTouch) {
+                    current.cancelledNativeTouch = true;
+                    cancelNativeTouch(chain, event);
+                }
+            }
+            if (current.handleSwipeUp(event)) {
+                if (type == MotionEvent.ACTION_POINTER_DOWN) current.pullCancelled = true;
+                if (type == MotionEvent.ACTION_UP || type == MotionEvent.ACTION_CANCEL) clear();
+                return true;
+            }
             if (type == MotionEvent.ACTION_MOVE || type == MotionEvent.ACTION_UP)
                 current.retractBannerPull(event);
             if (type == MotionEvent.ACTION_MOVE) {
@@ -680,6 +962,35 @@ public final class ReplyModule extends XposedModule {
             resetTimeout(container);
         }
 
+        private BannerSwipeUp fullScreenSwipeUp(ViewGroup container, View banner, View holder)
+                throws ReflectiveOperationException {
+            if (action == null || !matches(container, banner, action.key())) return null;
+            String key = action.key();
+            boolean expanded = holder.isShown();
+            if (!expanded && !key.equals(compactSwipeKeys.get(banner))) return null;
+            int height = banner.getHeight();
+            int compact = expanded ? compactHeights.getOrDefault(banner, height - holder.getHeight()) : height;
+            return newBannerSwipe(banner, expanded ? holder : null, height, compact, expanded, () -> {
+                try {
+                    if (!banner.isShown() || bannerView.get(container) != banner) return false;
+                    Object touch = touchHandler.get(container);
+                    StatusBarNotification shown = touch == null ? null : notification(currentEntry.get(touch));
+                    return shown != null && key.equals(shown.getKey());
+                } catch (ReflectiveOperationException | RuntimeException error) {
+                    warn(error);
+                    return false;
+                }
+            }, () -> {
+                closeReply(container, banner, key);
+                compactSwipeKeys.put(banner, key);
+            },
+                    () -> {
+                        compactSwipeKeys.remove(banner);
+                        hideBannerImmediately.invoke(bannerHelper.get(container));
+                    },
+                    backdrop -> backdrop.keepForEditor(holder, holder::isShown));
+        }
+
         private void start(ViewGroup container, MotionEvent event) throws ReflectiveOperationException {
             if (action == null || !(bannerView.get(container) instanceof View banner)
                     || !matches(container, banner, action.key())) return;
@@ -724,6 +1035,7 @@ public final class ReplyModule extends XposedModule {
         private boolean open(ViewGroup container, NotificationGesture current) throws ReflectiveOperationException {
             if (!matches(container, current.row, current.key)
                     || !(replyLayout.get(current.row) instanceof View holder) || holder.isShown()) return false;
+            compactHeights.put(current.row, current.row.getHeight());
             action.openEditor().onClick(current.row);
             if (!(replyEditor.get(current.row) instanceof View editor)
                     || holder.getVisibility() != View.VISIBLE) return false;
@@ -794,6 +1106,20 @@ public final class ReplyModule extends XposedModule {
 
         NotificationGesture gesture = bannerGestures.get(helper);
         if (gesture == null) return chain.proceed();
+        if (action == MotionEvent.ACTION_MOVE && gesture.swipeUp == null && gesture.followsSwipeUp(event)) {
+            guarded(() -> {
+                gesture.swipeUp = rowSwipeUp(gesture.row, false);
+            });
+            if (gesture.swipeUp != null && !gesture.cancelledNativeTouch) {
+                gesture.cancelledNativeTouch = true;
+                cancelNativeTouch(chain, event);
+            }
+        }
+        if (gesture.handleSwipeUp(event)) {
+            if (action == MotionEvent.ACTION_POINTER_DOWN) gesture.pullCancelled = true;
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) clearBanner(helper);
+            return true;
+        }
         if ((action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
                 && gesture.retractBannerPull(event)) resetBannerTimeout(helper, manager, gesture.key);
         if (action == MotionEvent.ACTION_MOVE) {
