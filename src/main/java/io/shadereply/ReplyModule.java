@@ -347,6 +347,14 @@ public final class ReplyModule extends XposedModule {
             getActualHeight = method(expandable, "getActualHeight");
             getMaxContentHeight = method(rowType, "getMaxContentHeight");
             setActualHeight = method(rowType, "setActualHeight", int.class, boolean.class);
+            hook(setActualHeight).intercept(chain -> {
+                // The stack animator can keep writing the pre-gesture height during collapse.
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    BannerSwipeUp swipe = bannerSwipes.get(chain.getThisObject());
+                    if (swipe != null && swipe.ownsRowHeight()) return null;
+                }
+                return chain.proceed();
+            });
             setSwipingToExpand = method(rowType, "setUserSwipingToExpandRow", boolean.class);
             isGroupSummary = method(rowType, "isSummaryWithChildren");
             swipingToExpand = field(rowType, "mIsUserSwipingToExpandRow");
@@ -535,6 +543,7 @@ public final class ReplyModule extends XposedModule {
 
     private BannerSwipeUp rowSwipeUp(View row, boolean allowCompact) throws ReflectiveOperationException {
         if (getHeadsUpHeight == null || removeHeadsUp == null || getActualHeight == null
+                || setActualHeight == null || bannerSwipes.containsKey(row)
                 || !(boolean) isHeadsUp.invoke(row) || !(boolean) isPinned.invoke(row)) return null;
         Candidate target = bannerCandidate(row, null);
         if (target == null) return null;
@@ -557,12 +566,20 @@ public final class ReplyModule extends XposedModule {
                 return false;
             }
         };
-        return newBannerSwipe(row, editor, height, compact, expanded, current, () -> {
+        BannerHeight heightControl = new BannerHeight() {
+            @Override public void set(int value) throws ReflectiveOperationException {
+                setActualHeight.invoke(row, value, false);
+            }
+
+            @Override public void restore(boolean committed) throws ReflectiveOperationException {
+                if (!committed && row.isAttachedToWindow() && current.getAsBoolean()) set(height);
+            }
+        };
+        return newBannerSwipe(row, row, editor, height, compact, expanded, heightControl, current, () -> {
             ++requestId;
             if (editor != null && (boolean) isEditorActive.invoke(editor)) closeBannerEditor(editor);
             if (expandedWhenPinned.getBoolean(row)) {
                 expandedWhenPinned.setBoolean(row, false);
-                setActualHeight.invoke(row, compact, true);
                 notifyHeightChanged.invoke(row, "ShadeReply collapse pinned banner", false);
             }
             compactSwipeKeys.put(row, key);
@@ -573,42 +590,43 @@ public final class ReplyModule extends XposedModule {
                 backdrop -> { if (editor != null) watchEditorBackdrop(backdrop, editor); });
     }
 
-    private BannerSwipeUp newBannerSwipe(View card, View editor, int height, int compact, boolean expanded,
-            BooleanSupplier current, CheckedAction collapse, CheckedAction dismiss,
-            Consumer<ReplyBackdrop> restoreBlur) {
-        if (height <= 0 || compact <= 0) return null;
-        return new BannerSwipeUp(card, editor, height, Math.min(compact, height), expanded, current,
-                collapse, dismiss, restoreBlur);
+    private interface BannerHeight {
+        void set(int height) throws ReflectiveOperationException;
+        void restore(boolean committed) throws ReflectiveOperationException;
     }
 
-    private void trackSwipe(View card, BannerSwipeUp swipe) {
-        BannerSwipeUp previous = bannerSwipes.get(card);
-        if (previous != swipe) {
-            if (previous != null) previous.restore();
-            bannerSwipes.put(card, swipe);
-        }
+    private BannerSwipeUp newBannerSwipe(View card, View surface, View editor, int height, int compact,
+            boolean expanded, BannerHeight heightControl, BooleanSupplier current, CheckedAction collapse, CheckedAction dismiss,
+            Consumer<ReplyBackdrop> restoreBlur) {
+        if (height <= 0 || compact <= 0) return null;
+        return new BannerSwipeUp(card, surface, editor, height, Math.min(compact, height), expanded,
+                heightControl, current, collapse, dismiss, restoreBlur);
     }
 
     private final class BannerSwipeUp implements View.OnAttachStateChangeListener {
-        private final View card, editor;
+        private final View card, surface, editor;
         private final int expanded, compact;
         private final float collapseDistance, dismissDistance;
         private final BooleanSupplier current;
         private final CheckedAction collapse, dismiss;
         private final Consumer<ReplyBackdrop> restoreBlur;
-        private Rect originalClip;
-        private final Rect swipeClip = new Rect();
+        private final BannerHeight heightControl;
+        private int renderedHeight;
         private float originalTranslation, offset, editorAlpha, blurProgress, distance, exitDistance;
         private ReplyBackdrop backdrop;
         private ValueAnimator settle;
-        private boolean started, finished;
+        private boolean started, finished, collapsed, writingHeight;
 
-        BannerSwipeUp(View card, View editor, int expanded, int compact, boolean startsExpanded, BooleanSupplier current,
-                CheckedAction collapse, CheckedAction dismiss, Consumer<ReplyBackdrop> restoreBlur) {
+        BannerSwipeUp(View card, View surface, View editor, int expanded, int compact, boolean startsExpanded,
+                BannerHeight heightControl, BooleanSupplier current, CheckedAction collapse,
+                CheckedAction dismiss, Consumer<ReplyBackdrop> restoreBlur) {
             this.card = card;
+            this.surface = surface;
             this.editor = editor;
             this.expanded = expanded;
             this.compact = compact;
+            this.heightControl = heightControl;
+            renderedHeight = expanded;
             this.current = current;
             this.collapse = collapse;
             this.dismiss = dismiss;
@@ -625,14 +643,17 @@ public final class ReplyModule extends XposedModule {
                 return;
             }
             if (!started) start();
-            render(Math.max(0f, up));
+            render(Math.min(Math.max(0f, up), collapseDistance > 0f ? collapseDistance : exitDistance));
+        }
+
+        boolean ownsRowHeight() {
+            return started && !finished && collapseDistance > 0f && !writingHeight;
         }
 
         private void start() {
-            trackSwipe(card, this);
+            bannerSwipes.put(card, this);
             started = true;
-            originalClip = card.getClipBounds();
-            originalTranslation = card.getTranslationY();
+            originalTranslation = surface.getTranslationY();
             if (editor != null) {
                 ReplyReveal.cancel(editor);
                 editorAlpha = editor.getAlpha();
@@ -647,29 +668,39 @@ public final class ReplyModule extends XposedModule {
 
         private void render(float up) {
             distance = up;
-            float collapsed = collapseDistance > 0f ? Math.min(1f, up / collapseDistance) : 1f;
-            if (expanded > compact) {
-                if (originalClip == null) swipeClip.set(0, 0, card.getWidth(), expanded);
-                else swipeClip.set(originalClip);
-                swipeClip.bottom = Math.max(swipeClip.top, Math.min(swipeClip.bottom,
-                        Math.round(expanded + (compact - expanded) * collapsed)));
-                card.setClipBounds(swipeClip);
+            if (collapseDistance == 0f) {
+                renderTranslation(up);
+                return;
+            }
+            float collapsed = up / collapseDistance;
+            int height = Math.round(expanded + (compact - expanded) * collapsed);
+            if (height != renderedHeight) {
+                try {
+                    writingHeight = true;
+                    heightControl.set(height);
+                    renderedHeight = height;
+                } catch (ReflectiveOperationException | RuntimeException error) {
+                    warn(error);
+                    restore();
+                    return;
+                } finally {
+                    writingHeight = false;
+                }
             }
             if (editor != null && editor != card) editor.setAlpha(editorAlpha * (1f - collapsed));
             if (backdrop != null) backdrop.drag(blurProgress * (1f - collapsed));
+        }
 
-            // Account for SystemUI moving the row while the keyboard is changing its insets.
-            float translation = card.getTranslationY();
-            if (translation != originalTranslation - offset) originalTranslation = translation;
-            offset = Math.min(exitDistance, Math.max(0f, up - collapseDistance));
-            card.setTranslationY(originalTranslation - offset);
+        private void renderTranslation(float up) {
+            offset = Math.min(exitDistance, up);
+            surface.setTranslationY(originalTranslation - offset);
         }
 
         void release(boolean cancelled) {
             if (!started || finished || settle != null) return;
-            boolean dismissCard = !cancelled && offset >= dismissDistance;
+            boolean dismissCard = !cancelled && collapseDistance == 0f && offset >= dismissDistance;
             boolean close = !cancelled && collapseDistance > 0f && distance >= collapseDistance * 0.5f;
-            float target = dismissCard ? collapseDistance + exitDistance : close ? collapseDistance : 0f;
+            float target = dismissCard ? exitDistance : close ? collapseDistance : 0f;
             if (distance == target || !ValueAnimator.areAnimatorsEnabled()) {
                 complete(target, close, dismissCard);
                 return;
@@ -697,7 +728,17 @@ public final class ReplyModule extends XposedModule {
                 return;
             }
             render(target);
-            if (close) guarded(collapse);
+            if (finished) return;
+            if (close) {
+                try {
+                    collapse.run();
+                    collapsed = true;
+                } catch (ReflectiveOperationException | RuntimeException error) {
+                    warn(error);
+                    restore();
+                    return;
+                }
+            }
             if (dismissCard) {
                 guarded(dismiss);
                 // Native removal may keep the detached or recycled row around until its animation ends.
@@ -721,8 +762,9 @@ public final class ReplyModule extends XposedModule {
                 settle = null;
             }
             card.removeOnAttachStateChangeListener(this);
-            card.setClipBounds(originalClip);
-            if (card.getTranslationY() == originalTranslation - offset) card.setTranslationY(originalTranslation);
+            if (renderedHeight != expanded) guarded(() -> heightControl.restore(collapsed));
+            if (offset != 0f && surface.getTranslationY() == originalTranslation - offset)
+                surface.setTranslationY(originalTranslation);
             if (editor != null && editor != card) editor.setAlpha(editorAlpha);
             if (backdrop != null) {
                 if (distance == 0f && current.getAsBoolean() && editor != null) restoreBlur.accept(backdrop);
@@ -732,6 +774,38 @@ public final class ReplyModule extends XposedModule {
 
         @Override public void onViewAttachedToWindow(View view) {}
         @Override public void onViewDetachedFromWindow(View view) { restore(); }
+    }
+
+    private static final class FullScreenBannerHeight implements BannerHeight {
+        private final View card, container;
+        private ViewGroup.LayoutParams cardParams, containerParams;
+        private int cardLayoutHeight, containerLayoutHeight, extraHeight;
+
+        FullScreenBannerHeight(View card, View container) {
+            this.card = card;
+            this.container = container;
+        }
+
+        @Override public void set(int height) {
+            if (cardParams == null) {
+                cardParams = card.getLayoutParams();
+                containerParams = container.getLayoutParams();
+                cardLayoutHeight = cardParams.height;
+                containerLayoutHeight = containerParams.height;
+                extraHeight = Math.max(0, container.getHeight() - card.getHeight());
+            }
+            // ColorOS draws the material, outline and spotlight from these two layout heights.
+            cardParams.height = height;
+            containerParams.height = height + extraHeight;
+            card.requestLayout();
+        }
+
+        @Override public void restore(boolean committed) {
+            if (cardParams == null) return;
+            cardParams.height = cardLayoutHeight;
+            containerParams.height = containerLayoutHeight;
+            card.requestLayout();
+        }
     }
 
     private void observeConfig(Context context) {
@@ -964,13 +1038,15 @@ public final class ReplyModule extends XposedModule {
 
         private BannerSwipeUp fullScreenSwipeUp(ViewGroup container, View banner, View holder)
                 throws ReflectiveOperationException {
-            if (action == null || !matches(container, banner, action.key())) return null;
+            if (action == null || bannerSwipes.containsKey(banner) || !matches(container, banner, action.key())) return null;
             String key = action.key();
             boolean expanded = holder.isShown();
             if (!expanded && !key.equals(compactSwipeKeys.get(banner))) return null;
             int height = banner.getHeight();
             int compact = expanded ? compactHeights.getOrDefault(banner, height - holder.getHeight()) : height;
-            return newBannerSwipe(banner, expanded ? holder : null, height, compact, expanded, () -> {
+            if (banner.getLayoutParams() == null || container.getLayoutParams() == null) return null;
+            return newBannerSwipe(banner, container, expanded ? holder : null, height, compact, expanded,
+                    new FullScreenBannerHeight(banner, container), () -> {
                 try {
                     if (!banner.isShown() || bannerView.get(container) != banner) return false;
                     Object touch = touchHandler.get(container);
