@@ -3,7 +3,6 @@ package io.shadereply
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -11,10 +10,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -25,7 +22,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -33,16 +29,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.github.libxposed.service.XposedService
 import io.github.suqi8.coui.kmp.basic.Card
@@ -82,7 +75,6 @@ class GestureSettingsActivity : ComponentActivity() {
     private var restartTargets by mutableStateOf<ScopeRestart?>(null)
     private var bubblePreference by mutableStateOf(-1)
     private var applyingBubblePreference by mutableStateOf(false)
-    private var showAbout by mutableStateOf(false)
     private var restarting by mutableStateOf(false)
     private var statusRequest = 0
 
@@ -116,7 +108,6 @@ class GestureSettingsActivity : ComponentActivity() {
                 savedInstanceState.getBoolean("restart_wechat"))
             confirmRestart = true
         }
-        showAbout = savedInstanceState?.getBoolean("show_about") ?: false
         hiddenIcon = packageManager.getComponentEnabledSetting(launcher) ==
             PackageManager.COMPONENT_ENABLED_STATE_DISABLED
         setContent {
@@ -155,7 +146,6 @@ class GestureSettingsActivity : ComponentActivity() {
                 }
             }
             RestartDialog()
-            AboutDialog()
         }
     }
 
@@ -182,7 +172,9 @@ class GestureSettingsActivity : ComponentActivity() {
                 enabled = !restarting, onClick = ::confirmScopeRestart,
             )
             RowDivider()
-            ArrowPreference(title = "关于", statusText = "v${version.versionName}", onClick = { showAbout = true })
+            ArrowPreference(title = "关于", statusText = "v${version.versionName}", onClick = {
+                startActivity(Intent(this, AboutActivity::class.java))
+            })
         }
     }
 
@@ -212,54 +204,6 @@ class GestureSettingsActivity : ComponentActivity() {
                 ),
             )
         }
-    }
-
-    @Composable
-    private fun AboutDialog() {
-        OverlayDialog(
-            show = showAbout,
-            title = "关于",
-            onDismissRequest = { showAbout = false },
-        ) {
-            Column {
-                Column(
-                    modifier = Modifier.fillMaxWidth().weight(1f, fill = false)
-                        .verticalScroll(rememberScrollState())
-                        .padding(start = 24.dp, end = 24.dp, top = 10.dp, bottom = 14.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Box(Modifier.size(68.dp).clip(RoundedCornerShape(18.dp)), contentAlignment = Alignment.Center) {
-                        Image(painterResource(R.drawable.module_icon_background), null, Modifier.fillMaxSize())
-                        Image(painterResource(R.drawable.module_icon_foreground), null, Modifier.fillMaxSize())
-                    }
-                    Text("通知快捷回复", style = COUITheme.textStyles.title4,
-                        fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
-                    Text("v${version.versionName} · ColorOS 17",
-                        color = COUITheme.colorScheme.onSurfaceVariantSummary,
-                        style = COUITheme.textStyles.subtitle, textAlign = TextAlign.Center)
-                    Text("长按或下拉支持原生文字回复的通知，即可打开回复框。",
-                        Modifier.padding(top = 6.dp), color = COUITheme.colorScheme.onSurface,
-                        style = COUITheme.textStyles.footnote1, textAlign = TextAlign.Center)
-                    ArrowPreference(title = "项目主页", onClick = {
-                        openProjectPage("https://github.com/Xinhuaaa/shadereply")
-                    })
-                    ArrowPreference(title = "检查更新", onClick = {
-                        openProjectPage("https://github.com/Xinhuaaa/shadereply/releases")
-                    })
-                }
-                DialogButtonBar(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    negative = null,
-                    positive = DialogButtonBarAction(text = "关闭", onClick = { showAbout = false }),
-                )
-            }
-        }
-    }
-
-    private fun openProjectPage(url: String) {
-        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
-            .onFailure { toast("找不到可打开链接的应用") }
     }
 
     @Composable
@@ -469,7 +413,6 @@ class GestureSettingsActivity : ComponentActivity() {
         outState.putBoolean("confirm_restart", confirmRestart)
         outState.putBoolean("restart_system_ui", restartTargets?.systemUi == true)
         outState.putBoolean("restart_wechat", restartTargets?.weChat == true)
-        outState.putBoolean("show_about", showAbout)
         super.onSaveInstanceState(outState)
     }
 

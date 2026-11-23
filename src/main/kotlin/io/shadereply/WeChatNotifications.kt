@@ -1,11 +1,13 @@
 package io.shadereply
 
 import android.app.Application
+import android.app.AppComponentFactory
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Person
 import android.app.RemoteInput
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -440,38 +442,60 @@ internal object WeChatNotifications {
     }
 
     private fun hookActions(module: XposedModule, loader: ClassLoader) {
-        val receiver = loader.loadClass(RECEIVER).getDeclaredMethod("onReceive", Context::class.java, Intent::class.java)
-        module.hook(receiver).intercept { chain ->
-            val intent = chain.getArg(1) as Intent
-            if (intent.action !in setOf(REPLY, READ, DISMISS)) return@intercept chain.proceed()
-            val context = chain.getArg(0) as Context
-            val talker = intent.getStringExtra("talker") ?: return@intercept null
-            val revision = intent.getStringExtra(REVISION) ?: return@intercept null
-            val tag = intent.getStringExtra("tag")
-            val id = intent.getIntExtra("id", 0)
-            if (intent.action == DISMISS) {
-                synchronized(stateLock) {
-                    if (history[talker]?.revision == revision) history.remove(talker)
-                }
-                runCatching { intent.getParcelableExtra("original", PendingIntent::class.java)?.send() }
-                return@intercept null
+        val signature = arrayOf(ClassLoader::class.java, String::class.java, Intent::class.java)
+        val factory = runCatching {
+            loader.loadClass("androidx.core.app.CoreComponentFactory")
+                .getMethod("instantiateReceiver", *signature)
+        }.getOrElse { AppComponentFactory::class.java.getMethod("instantiateReceiver", *signature) }
+        module.hook(factory).intercept { chain ->
+            val intent = chain.getArg(2) as? Intent
+            if (chain.getArg(1) != RECEIVER || intent?.component != ComponentName(PACKAGE, RECEIVER)) {
+                return@intercept chain.proceed()
             }
-            if (!settings.enabled) return@intercept null
-            val text = if (intent.action == REPLY) {
-                RemoteInput.getResultsFromIntent(intent)?.getCharSequence(KEY_TEXT)?.toString()
-                    ?.takeIf(String::isNotBlank) ?: run {
-                        module.log(Log.WARN, TAG, "WeChat reply arrived without remote input", null)
-                        return@intercept null
+            when (intent.action) {
+                // Keep the non-exported manifest component so Android can start WeChat for an action.
+                REPLY, READ, DISMISS -> object : BroadcastReceiver() {
+                    override fun onReceive(context: Context, intent: Intent) {
+                        receiveAction(module, this, context, intent)
                     }
-            } else null
-            if (intent.data?.lastPathSegment != revision) return@intercept null
-            val manager = context.getSystemService(NotificationManager::class.java)
-            if (text == null && current(manager, tag, id, revision) == null) return@intercept null
-            val pending = (chain.thisObject as android.content.BroadcastReceiver).goAsync()
-            val deadline = SystemClock.uptimeMillis() + 5_000
-            if (text != null) module.log(Log.INFO, TAG, "Received WeChat notification reply", null)
+                }
+                else -> chain.proceed()
+            }
+        }
+    }
+
+    private fun receiveAction(module: XposedModule, receiver: BroadcastReceiver, context: Context, intent: Intent) {
+        val talker = intent.getStringExtra("talker")
+        val revision = intent.getStringExtra(REVISION)
+        if (talker.isNullOrBlank() || revision.isNullOrBlank() ||
+            intent.data != Uri.parse("shadereply://notification/$revision")) {
+            module.log(Log.WARN, TAG, "WeChat notification action arrived without valid routing data", null)
+            return
+        }
+        val tag = intent.getStringExtra("tag")
+        val id = intent.getIntExtra("id", 0)
+        if (intent.action == DISMISS) {
+            synchronized(stateLock) {
+                if (history[talker]?.revision == revision) history.remove(talker)
+            }
+            runCatching { intent.getParcelableExtra("original", PendingIntent::class.java)?.send() }
+            return
+        }
+        if (!settings.enabled) return
+        val text = if (intent.action == REPLY) {
+            RemoteInput.getResultsFromIntent(intent)?.getCharSequence(KEY_TEXT)?.toString()
+                ?.takeIf(String::isNotBlank) ?: run {
+                    module.log(Log.WARN, TAG, "WeChat reply arrived without remote input", null)
+                    return
+                }
+        } else null
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (text == null && current(manager, tag, id, revision) == null) return
+        val pending = receiver.goAsync()
+        val deadline = SystemClock.uptimeMillis() + 7_000
+        if (text != null) module.log(Log.INFO, TAG, "Received WeChat notification reply", null)
+        main.post {
             performAction(module, context, manager, tag, id, revision, talker, text, deadline, pending::finish)
-            null
         }
     }
 
