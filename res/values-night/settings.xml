@@ -1,0 +1,17 @@
+<resources>
+    <color name="settings_background">#11151D</color>
+    <color name="settings_card">#1C232F</color>
+    <color name="settings_text">#EEF2F9</color>
+    <color name="settings_muted">#BCC7D8</color>
+    <color name="settings_line">#333E50</color>
+    <color name="settings_accent">#A2BFFF</color>
+    <color name="settings_selected">#273754</color>
+    <color name="settings_good">#9CE3C2</color>
+    <color name="settings_good_background">#243F37</color>
+    <color name="settings_on_accent">#142540</color>
+    <bool name="settings_light_bars">false</bool>
+    <style name="SettingsTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:colorAccent">@color/settings_accent</item>
+        <item name="android:windowBackground">@color/settings_background</item>
+    </style>
+</resources>

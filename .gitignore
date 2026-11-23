@@ -1,0 +1,13 @@
+/.gradle/
+/.kotlin/
+/.idea/
+/build/
+/deps/
+/verify-notification/
+/local.properties
+*.apk
+*.idsig
+*.keystore
+*.jks
+*.log
+__pycache__/

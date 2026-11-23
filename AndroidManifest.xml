@@ -1,0 +1,45 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- This module starts at API 37, where the platform handles receiver export flags. -->
+    <permission android:name="${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+        tools:node="remove" />
+    <uses-permission android:name="${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+        tools:node="remove" />
+    <application android:name=".ModuleApplication" android:label="通知快捷回复"
+        android:description="@string/module_description"
+        android:icon="@mipmap/module_icon" android:roundIcon="@mipmap/module_icon"
+        android:theme="@style/SettingsTheme"
+        android:allowBackup="false" android:hasCode="true">
+        <activity android:name=".GestureSettingsActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <activity-alias android:name=".Launcher" android:targetActivity=".GestureSettingsActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <provider android:name=".GestureConfigProvider"
+            android:authorities="${applicationId}.gestures"
+            android:readPermission="android.permission.STATUS_BAR_SERVICE"
+            android:writePermission="android.permission.STATUS_BAR_SERVICE"
+            android:directBootAware="true"
+            android:exported="true" />
+        <provider android:name=".WeChatPreviewProvider"
+            android:authorities="${applicationId}.previews"
+            android:grantUriPermissions="true"
+            android:exported="true" />
+        <provider android:name="io.github.libxposed.service.XposedProvider"
+            android:authorities="${applicationId}.XposedService"
+            android:exported="true" />
+    </application>
+    <queries>
+        <package android:name="com.tencent.mm" />
+        <package android:name="com.android.systemui" />
+    </queries>
+</manifest>
