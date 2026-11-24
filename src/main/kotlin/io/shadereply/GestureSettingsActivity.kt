@@ -1,5 +1,7 @@
 package io.shadereply
 
+import android.Manifest
+import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -9,6 +11,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -60,6 +63,9 @@ import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 class GestureSettingsActivity : ComponentActivity() {
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        if (allowed) postTestNotification() else toast("允许通知后才能发送测试通知")
+    }
     private val serviceWorker = Executors.newSingleThreadExecutor()
     private val module get() = application as ModuleApplication
     private val launcher by lazy { ComponentName(this, "$packageName.Launcher") }
@@ -101,7 +107,8 @@ class GestureSettingsActivity : ComponentActivity() {
         weChat = savedInstanceState?.let {
             WeChatConfig(it.getBoolean("wechat_enabled"), it.getBoolean("wechat_bubbles"),
                 it.getBoolean("wechat_hide_read"), it.getBoolean("wechat_clear_history"),
-                it.getInt("wechat_image_mode", WeChatConfig.IMAGE_THUMB), it.getBoolean("wechat_wait_sticker", true))
+                it.getInt("wechat_image_mode", WeChatConfig.IMAGE_THUMB), it.getBoolean("wechat_wait_sticker", true),
+                it.getBoolean("wechat_voice_text"))
         } ?: savedWeChat
         if (savedInstanceState?.getBoolean("confirm_restart") == true) {
             restartTargets = ScopeRestart(savedInstanceState.getBoolean("restart_system_ui"),
@@ -156,6 +163,8 @@ class GestureSettingsActivity : ComponentActivity() {
         PullSettings()
         WeChatSettings()
         Group {
+            ArrowPreference(title = "测试通知", onClick = ::postTestNotification)
+            RowDivider()
             SwitchPreference(
                 title = "隐藏桌面图标", checked = hiddenIcon,
                 summary = "可从 LSPosed 的模块列表启动本应用",
@@ -175,6 +184,17 @@ class GestureSettingsActivity : ComponentActivity() {
             ArrowPreference(title = "关于", statusText = "v${version.versionName}", onClick = {
                 startActivity(Intent(this, AboutActivity::class.java))
             })
+        }
+    }
+
+    private fun postTestNotification() {
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        val manager = getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled() || !TestNotification.post(this)) {
+            toast("请在系统设置中开启 ShadeReply 的测试通知")
         }
     }
 
@@ -345,6 +365,12 @@ class GestureSettingsActivity : ComponentActivity() {
                 summary = "稍等微信缓存贴纸，预览就绪后更新通知",
                 onCheckedChange = { weChat = weChat.copy(waitSticker = it) },
             )
+            RowDivider()
+            SwitchPreference(
+                title = "语音自动转文字", checked = weChat.voiceText, enabled = weChat.enabled,
+                summary = "调用微信的语音转文字服务，完成后更新通知",
+                onCheckedChange = { weChat = weChat.copy(voiceText = it) },
+            )
         }
     }
 
@@ -405,6 +431,7 @@ class GestureSettingsActivity : ComponentActivity() {
         outState.putBoolean("wechat_clear_history", weChat.clearHistory)
         outState.putInt("wechat_image_mode", weChat.imageMode)
         outState.putBoolean("wechat_wait_sticker", weChat.waitSticker)
+        outState.putBoolean("wechat_voice_text", weChat.voiceText)
         outState.putBoolean("hold", settings.hold())
         outState.putInt("time", settings.holdMs())
         outState.putBoolean("pull", settings.pull())

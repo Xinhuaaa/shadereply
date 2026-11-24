@@ -5,15 +5,16 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.Bundle
 import android.os.SystemClock
 import org.luckypray.dexkit.DexKitBridge
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.io.File
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.reflect.Proxy
 import java.util.concurrent.Executors
+import java.util.UUID
 
 // Media lookup signatures adapted from SymonChu/WeKite, GPL-3.0.
 internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val report: (String, Throwable) -> Unit) {
@@ -32,16 +33,18 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
     val sent = field("isSend")
     private val type = field("type")
     private val serverId = field("msgSvrId")
-    private val imagePath = field("imgPath")
+    val imagePath = field("imgPath")
+    val localId = field("msgId")
     private val image = runCatching { ImageLookup(dex, loader, insert.parameterTypes.first()) }
         .onFailure { report("Picture lookup unavailable", it) }.getOrNull()
     private val sticker = runCatching { StickerLookup(dex, loader) }
         .onFailure { report("Sticker lookup unavailable", it) }.getOrNull()
     private val decoder = runCatching { loader.loadClass("com.tencent.mm.plugin.gif.MMWXGFJNI") }.getOrNull()
-
+    private val fileProvider = runCatching {
+        loader.loadClass("android.support.v4.content.FileProvider").getMethod(
+            "getUriForFile", Context::class.java, String::class.java, File::class.java)
+    }.getOrNull()
     fun typeOf(message: Any): Int = type.getInt(message)
-
-    fun supports(message: Any) = supportsType(typeOf(message))
 
     fun supportsType(messageType: Int): Boolean = when (messageType) {
         3 -> image != null
@@ -76,15 +79,8 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
                 }.getOrNull()
                 if (decoded != null) {
                     val (mime, payload) = decoded
-                    runCatching {
-                        val result = context.contentResolver.call(WeChatPreviewProvider.ROOT, "store", null,
-                            Bundle().apply {
-                                putString("mime", mime)
-                                putByteArray("image", payload)
-                            })
-                        val uri = result?.getString("uri") ?: error("Preview provider did not return an attachment")
-                        callback(mime, Uri.parse(uri))
-                    }.onFailure { report("Could not publish the notification attachment", it) }
+                    runCatching { storePreview(context, mime, payload, callback) }
+                        .onFailure { report("Could not publish the notification attachment", it) }
                     return@execute
                 }
                 if (md5 != null && config.waitSticker && !requestedSticker) {
@@ -94,6 +90,27 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
                 SystemClock.sleep(80)
             } while (true)
         }
+    }
+
+    private fun storePreview(context: Context, mime: String, bytes: ByteArray, callback: (String, Uri) -> Unit) {
+        val provider = fileProvider ?: error("WeChat attachment provider unavailable")
+        val folder = File(context.cacheDir, "shadereply-previews").apply { mkdirs() }
+        val extension = if (mime == "image/jpeg") "jpg" else mime.substringAfter('/')
+        val uri = synchronized(previewLock) {
+            val now = System.currentTimeMillis()
+            folder.listFiles().orEmpty().sortedByDescending(File::lastModified).forEachIndexed { index, file ->
+                if (index >= 127 || now - file.lastModified() > 86_400_000L) file.delete()
+            }
+            val file = File(folder, "${UUID.randomUUID()}.$extension")
+            file.writeBytes(bytes)
+            try {
+                provider.invoke(null, context, "com.tencent.mm.external.fileprovider", file) as Uri
+            } catch (failure: ReflectiveOperationException) {
+                file.delete()
+                throw failure
+            }
+        }
+        callback(mime, uri)
     }
 
     private fun decode(raw: ByteArray, isSticker: Boolean): Pair<String, ByteArray>? {
@@ -108,6 +125,8 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
             }.getOrNull() ?: return null
         } else raw
         val type = mime(bytes) ?: return null
+        // GIF and WebP can carry animation. Keep the encoded frames in the file-backed preview.
+        if (isSticker && type in ANIMATED_FORMATS && bytes.size <= MAX_INPUT) return type to bytes
         if (bytes.size <= limit) return type to bytes
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
@@ -165,7 +184,7 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
             val options = if (mode == WeChatConfig.IMAGE_LARGE) {
                 listOf("ORIGIN_IMAGE" to names?.large, "BIG_IMAGE" to names?.large,
                     "MID_IMAGE" to names?.mid, "THUMB_IMAGE" to (names?.thumb ?: thumbPath))
-            } else listOf("THUMB_IMAGE" to (names?.thumb ?: thumbPath))
+            } else listOf("MID_IMAGE" to names?.mid, "THUMB_IMAGE" to (names?.thumb ?: thumbPath))
             return options.firstNotNullOfOrNull { (kind, name) ->
                 val category = kinds[kind]
                 if (name.isNullOrEmpty() || category == null) return@firstNotNullOfOrNull null
@@ -256,6 +275,8 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
     companion object {
         private const val MAX_INPUT = 8 * 1024 * 1024
         private val worker = Executors.newFixedThreadPool(2)
+        private val previewLock = Any()
+        private val ANIMATED_FORMATS = setOf("image/gif", "image/webp")
         private val md5Pattern = Regex("[a-fA-F0-9]{32}")
         private val stickerAttr = Regex("""\bmd5=["']([a-fA-F0-9]{32})["']""")
         private val stickerTag = Regex("""<md5>\s*([a-fA-F0-9]{32})\s*</md5>""")

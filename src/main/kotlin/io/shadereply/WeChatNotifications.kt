@@ -43,9 +43,11 @@ internal object WeChatNotifications {
     private const val REPLY = ACTION + "REPLY"
     private const val READ = ACTION + "READ"
     private const val DISMISS = ACTION + "DISMISS"
+    private const val TRANSCRIBE = ACTION + "TRANSCRIBE"
     private const val KEY_TEXT = ACTION + "TEXT"
     private const val REVISION = ACTION + "REVISION"
     private const val CONVERSATION = ACTION + "CONVERSATION"
+    private const val MESSAGE_ID = ACTION + "MESSAGE_ID"
     private const val SHORTCUT_ICON_VERSION = ACTION + "ICON_VERSION"
     private const val HISTORY_LIMIT = 7
     private val messageCount = Regex("""^\[\d+条]\s*""")
@@ -70,6 +72,7 @@ internal object WeChatNotifications {
     @Volatile private var avatar: Method? = null
     @Volatile private var avatarLoader: Any? = null
     @Volatile private var media: WeChatMedia? = null
+    @Volatile private var voice: WeChatVoice? = null
 
     private data class Incoming(val talker: String, val content: String, val type: Int, val message: Any?)
     private data class History(val revision: String, val messages: List<Notification.MessagingStyle.Message>)
@@ -137,6 +140,14 @@ internal object WeChatNotifications {
                     }
                         .onFailure { module.log(Log.WARN, TAG, "Message preview hooks unavailable", it) }
                         .getOrNull()
+                    if (process == PACKAGE) {
+                        voice = runCatching {
+                            val flags = android.content.pm.PackageManager.PackageInfoFlags.of(0)
+                            if (context.packageManager.getPackageInfo(PACKAGE, flags).longVersionCode == 3180L)
+                                WeChatVoice(loader) else null
+                        }
+                            .onFailure { module.log(Log.WARN, TAG, "Voice transcription unavailable", it) }.getOrNull()
+                    }
                     if (process == PACKAGE) reading?.let { read ->
                         module.hook(read.update).intercept { chain ->
                             val result = chain.proceed()
@@ -160,7 +171,8 @@ internal object WeChatNotifications {
             val result = chain.proceed()
             if (settings.enabled && result is Long && result >= 0) runCatching {
                 val message = chain.getArg(0) ?: return@runCatching
-                if (media.sent.getInt(message) == 0 && media.supports(message)) {
+                val type = media.typeOf(message)
+                if (media.sent.getInt(message) == 0 && (media.supportsType(type) || type == 34 && settings.voiceText)) {
                     val talker = media.talker.get(message) as? String ?: return@runCatching
                     val body = media.content.get(message) as? String ?: return@runCatching
                     synchronized(stateLock) {
@@ -247,7 +259,15 @@ internal object WeChatNotifications {
         incoming: Incoming, tag: String?, id: Int, posted: Notification,
     ) {
         val resolver = media ?: return
-        if (!resolver.supportsType(incoming.type)) return
+        val postedMessage = messages(posted).lastOrNull() ?: return
+        val messageId = postedMessage.extras.getString(MESSAGE_ID) ?: return
+        fun attachment(type: String, uri: Uri) = updatePostedMessage(module, context, incoming.talker, tag, id, messageId) {
+            if (incoming.type == 3 && settings.imageMode == WeChatConfig.IMAGE_OFF) return@updatePostedMessage it
+            it.extras.putBoolean(NotificationMedia.PREVIEW, true)
+            it.setData(type, uri)
+        }
+        if (!resolver.supportsType(incoming.type) && incoming.type != 34) return
+        if (incoming.type == 34 && !config.voiceText) return
         val body = mediaBody(incoming.content)
         val message = incoming.message?.takeIf {
             resolver.talker.get(it) == incoming.talker && resolver.typeOf(it) == incoming.type &&
@@ -263,28 +283,69 @@ internal object WeChatNotifications {
             if (queue.isEmpty()) pendingMedia.remove(incoming.talker)
             selected?.instance
         }
-        if (message == null && (incoming.type == 3 || WeChatMedia.stickerId(incoming.content) == null)) return
-        val revision = posted.extras.getString(REVISION) ?: return
-        resolver.resolve(context, incoming.type, message, incoming.content, config) { type, uri ->
-            main.post {
-                if (!settings.enabled) return@post
-                runCatching {
-                    val manager = context.getSystemService(NotificationManager::class.java)
-                    val notification = current(manager, tag, id, revision) ?: return@runCatching
-                    val messages = messages(notification)
-                    val latest = messages.lastOrNull() ?: return@runCatching
-                    if (latest.senderPerson?.key == self.key) return@runCatching
-                    latest.setData(type, uri)
-                    val builder = Notification.Builder.recoverBuilder(context, notification.clone())
-                        .setOnlyAlertOnce(true).setStyle(Notification.MessagingStyle(self).apply {
-                            setGroupConversation(notification.extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION))
-                            conversationTitle = notification.extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
-                            messages.forEach(::addMessage)
-                        })
-                    synchronized(stateLock) { history[incoming.talker] = History(revision, messages) }
-                    if (current(manager, tag, id, revision) != null) manager.notify(tag, id, builder.build())
-                }.onFailure { module.log(Log.WARN, TAG, "Preview update skipped", it) }
+        if (incoming.type == 34) {
+            if (message != null) {
+                val request = Intent(TRANSCRIBE).setComponent(ComponentName(PACKAGE, RECEIVER))
+                    .putExtra("talker", incoming.talker).putExtra("tag", tag).putExtra("id", id)
+                    .putExtra(MESSAGE_ID, messageId)
+                    .putExtra("local_id", resolver.localId.getLong(message))
+                    .putExtra("voice_path", resolver.imagePath.get(message) as? String)
+                if (process == PACKAGE) main.post { requestTranscript(module, context, request) }
+                else context.sendBroadcast(request)
             }
+            return
+        }
+        if (message == null && (incoming.type == 3 || WeChatMedia.stickerId(incoming.content) == null)) return
+        resolver.resolve(context, incoming.type, message, incoming.content, config, ::attachment)
+    }
+
+    private fun requestTranscript(module: XposedModule, context: Context, intent: Intent) {
+        if (!settings.enabled || !settings.voiceText) return
+        val talker = intent.getStringExtra("talker") ?: return
+        val messageId = intent.getStringExtra(MESSAGE_ID) ?: return
+        val tag = intent.getStringExtra("tag")
+        val id = intent.getIntExtra("id", 0)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val notification = active(manager, tag, id) ?: return
+        if (notification.extras.getString(CONVERSATION) != conversationId(talker) ||
+            messages(notification).none { it.extras.getString(MESSAGE_ID) == messageId }) return
+        runCatching {
+            voice?.transcribe(talker, intent.getLongExtra("local_id", 0), intent.getStringExtra("voice_path")) { transcript ->
+                updatePostedMessage(module, context, talker, tag, id, messageId) { original ->
+                    if (!settings.voiceText) original else Notification.MessagingStyle.Message(
+                        "[语音] $transcript", original.timestamp, original.senderPerson,
+                    ).apply { extras.putAll(original.extras) }
+                }
+            }
+        }.onFailure { module.log(Log.WARN, TAG, "Voice transcription failed to start", it) }
+    }
+
+    private fun updatePostedMessage(
+        module: XposedModule, context: Context, talker: String, tag: String?, id: Int,
+        messageId: String, update: (Notification.MessagingStyle.Message) -> Notification.MessagingStyle.Message,
+    ) {
+        main.post {
+            if (!settings.enabled) return@post
+            runCatching {
+                val manager = context.getSystemService(NotificationManager::class.java)
+                val notification = active(manager, tag, id)
+                    ?.takeIf { it.extras.getString(CONVERSATION) == conversationId(talker) } ?: return@runCatching
+                val revision = notification.extras.getString(REVISION) ?: return@runCatching
+                val messages = messages(notification).toMutableList()
+                val index = messages.indexOfFirst { it.extras.getString(MESSAGE_ID) == messageId }
+                if (index < 0) return@runCatching
+                messages[index] = update(messages[index])
+                val builder = Notification.Builder.recoverBuilder(context, notification.clone())
+                    .setOnlyAlertOnce(true).setStyle(Notification.MessagingStyle(self).apply {
+                        setGroupConversation(notification.extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION))
+                        conversationTitle = notification.extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
+                        messages.forEach(::addMessage)
+                    })
+                if (current(manager, tag, id, revision) != null) {
+                    manager.notify(tag, id, builder.build())
+                    synchronized(stateLock) { history[talker] = History(revision, messages) }
+                }
+            }.onFailure { module.log(Log.WARN, TAG, "Preview update skipped", it) }
         }
     }
 
@@ -316,6 +377,7 @@ internal object WeChatNotifications {
         val message = Notification.MessagingStyle.Message(sender?.groupValues?.get(2) ?: body, whenPosted, participant)
         val conversation = conversationId(talker)
         val revision = UUID.randomUUID().toString()
+        message.extras.putString(MESSAGE_ID, revision)
         val manager = context.getSystemService(NotificationManager::class.java)
         val previous = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == id }?.notification
         val previousForChat = previous?.takeIf { it.extras.getString(CONVERSATION) == conversation }
@@ -454,9 +516,10 @@ internal object WeChatNotifications {
             }
             when (intent.action) {
                 // Keep the non-exported manifest component so Android can start WeChat for an action.
-                REPLY, READ, DISMISS -> object : BroadcastReceiver() {
+                REPLY, READ, DISMISS, TRANSCRIBE -> object : BroadcastReceiver() {
                     override fun onReceive(context: Context, intent: Intent) {
-                        receiveAction(module, this, context, intent)
+                        if (intent.action == TRANSCRIBE) requestTranscript(module, context, intent)
+                        else receiveAction(module, this, context, intent)
                     }
                 }
                 else -> chain.proceed()
@@ -467,13 +530,13 @@ internal object WeChatNotifications {
     private fun receiveAction(module: XposedModule, receiver: BroadcastReceiver, context: Context, intent: Intent) {
         val talker = intent.getStringExtra("talker")
         val revision = intent.getStringExtra(REVISION)
+        val tag = intent.getStringExtra("tag")
+        val id = intent.getIntExtra("id", 0)
         if (talker.isNullOrBlank() || revision.isNullOrBlank() ||
-            intent.data != Uri.parse("shadereply://notification/$revision")) {
+            !matchesActionRoute(intent, talker, tag, id, revision)) {
             module.log(Log.WARN, TAG, "WeChat notification action arrived without valid routing data", null)
             return
         }
-        val tag = intent.getStringExtra("tag")
-        val id = intent.getIntExtra("id", 0)
         if (intent.action == DISMISS) {
             synchronized(stateLock) {
                 if (history[talker]?.revision == revision) history.remove(talker)
@@ -584,6 +647,7 @@ internal object WeChatNotifications {
                     val mime = item.getString("type")
                     val uri = item.getParcelable("uri", Uri::class.java)
                     if (mime != null && uri != null) setData(mime, uri)
+                    item.getBundle("extras")?.let(extras::putAll)
                 }
             }
 
@@ -591,13 +655,29 @@ internal object WeChatNotifications {
         context: Context, action: String, talker: String, tag: String?, id: Int, revision: String,
         original: PendingIntent? = null,
     ): PendingIntent {
+        val isReply = action == REPLY
         val intent = Intent(action).setComponent(ComponentName(PACKAGE, RECEIVER))
-            .setData(Uri.parse("shadereply://notification/$revision"))
+            .setData(if (isReply) replyRoute(talker, tag, id) else revisionRoute(revision))
             .putExtra("talker", talker).putExtra("tag", tag).putExtra("id", id)
             .putExtra(REVISION, revision).putExtra("original", original)
-        val flags = if (action == REPLY) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE
+        val flags = if (isReply) PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            else PendingIntent.FLAG_IMMUTABLE
         return PendingIntent.getBroadcast(context, 0, intent, flags)
     }
+
+    private fun matchesActionRoute(intent: Intent, talker: String, tag: String?, id: Int, revision: String): Boolean =
+        // Accept revision-scoped replies already posted by older builds.
+        intent.data == revisionRoute(revision) ||
+            (intent.action == REPLY && intent.data == replyRoute(talker, tag, id))
+
+    private fun revisionRoute(revision: String): Uri = Uri.parse("shadereply://notification/$revision")
+
+    // SystemUI matches the open editor to the updated reply action with Intent.filterEquals.
+    private fun replyRoute(talker: String, tag: String?, id: Int): Uri = Uri.Builder()
+        .scheme("shadereply").authority("reply")
+        .appendPath(conversationId(talker)).appendPath(id.toString())
+        .apply { tag?.let { appendPath(conversationId(it)) } }
+        .build()
 
     private fun conversationId(talker: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(talker.toByteArray())

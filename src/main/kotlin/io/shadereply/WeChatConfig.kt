@@ -10,6 +10,7 @@ internal data class WeChatConfig(
     val clearHistory: Boolean = false,
     val imageMode: Int = IMAGE_THUMB,
     val waitSticker: Boolean = true,
+    val voiceText: Boolean = false,
 ) {
     fun save(prefs: SharedPreferences): Boolean = prefs.edit()
         .putBoolean("enabled", enabled)
@@ -18,6 +19,7 @@ internal data class WeChatConfig(
         .putBoolean("clear_history", clearHistory)
         .putInt("image_mode", imageMode)
         .putBoolean("wait_sticker", waitSticker)
+        .putBoolean("voice_text", voiceText)
         .commit()
 
     companion object {
@@ -36,6 +38,7 @@ internal data class WeChatConfig(
             prefs.getBoolean("clear_history", false),
             prefs.getInt("image_mode", IMAGE_THUMB).coerceIn(IMAGE_OFF, IMAGE_LARGE),
             prefs.getBoolean("wait_sticker", true),
+            prefs.getBoolean("voice_text", false),
         )
     }
 }

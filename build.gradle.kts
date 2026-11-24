@@ -14,8 +14,8 @@ android {
         applicationId = "io.shadereply"
         minSdk = 37
         targetSdk = 37
-        versionCode = 49
-        versionName = "0.1.48"
+        versionCode = 54
+        versionName = "0.1.53"
     }
     providers.gradleProperty("shadereplyDebugKeystore").orNull?.let { path ->
         signingConfigs.getByName("debug").storeFile = file(path)
