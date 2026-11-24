@@ -6,6 +6,7 @@ import android.animation.ValueAnimator;
 import android.graphics.Rect;
 import android.view.View;
 import android.view.ViewTreeObserver;
+import android.view.animation.LinearInterpolator;
 import android.view.animation.PathInterpolator;
 
 import java.lang.ref.WeakReference;
@@ -18,6 +19,12 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
 
     private final View view;
     private final boolean editor;
+    private final View card;
+    private final Rect replyButton;
+    private final BannerCollapseContent.Layer morph;
+    private final BannerReplyMotion replyMotion;
+    private final int[] position = new int[2];
+    private Runnable releaseOrigin;
     private final Runnable timeout = this::finish;
     private final ViewTreeObserver observer;
     private final Rect reveal = new Rect();
@@ -31,10 +38,29 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
     private ValueAnimator animator;
 
     static void show(View view, boolean editor) {
-        if (view == null || !view.isAttachedToWindow() || !ValueAnimator.areAnimatorsEnabled()) return;
+        show(view, editor, null, null, null);
+    }
+
+    static void showEditor(View editor, View card, Rect replyButton) {
+        showEditor(editor, card, replyButton, null);
+    }
+
+    static void showEditor(View editor, View card, Rect replyButton, Runnable releaseOrigin) {
+        show(editor, true, card, replyButton, releaseOrigin);
+    }
+
+    private static void show(View view, boolean editor, View card, Rect replyButton, Runnable releaseOrigin) {
+        if (view == null || !view.isAttachedToWindow() || !ValueAnimator.areAnimatorsEnabled()) {
+            if (releaseOrigin != null) releaseOrigin.run();
+            return;
+        }
         WeakReference<ReplyReveal> current = running.get(view);
-        if (current != null && current.get() != null) return;
-        ReplyReveal transition = new ReplyReveal(view, editor);
+        if (current != null && current.get() != null) {
+            if (releaseOrigin != null) releaseOrigin.run();
+            return;
+        }
+        ReplyReveal transition = new ReplyReveal(view, editor, card, replyButton);
+        transition.releaseOrigin = releaseOrigin;
         running.put(view, new WeakReference<>(transition));
         view.addOnAttachStateChangeListener(transition);
         transition.observer.addOnPreDrawListener(transition);
@@ -48,9 +74,13 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
         if (transition != null) transition.finish();
     }
 
-    private ReplyReveal(View view, boolean editor) {
+    private ReplyReveal(View view, boolean editor, View card, Rect replyButton) {
         this.view = view;
         this.editor = editor;
+        this.card = card;
+        this.replyButton = replyButton;
+        replyMotion = BannerReplyMotion.create(card, view, replyButton);
+        morph = replyButton == null || replyMotion != null ? null : new BannerCollapseContent.Layer(view);
         observer = view.getViewTreeObserver();
     }
 
@@ -58,15 +88,20 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
     public boolean onPreDraw() {
         if (finished || !view.isShown() || view.getWidth() == 0 || view.getHeight() == 0) return true;
         stopWaiting();
-        originalClip = view.getClipBounds();
-        originalAlpha = view.getTransitionAlpha();
-        lastAlpha = originalAlpha;
-        ownsClip = true;
-        ownsAlpha = true;
+        if (morph == null && replyMotion == null) {
+            originalClip = view.getClipBounds();
+            originalAlpha = view.getTransitionAlpha();
+            lastAlpha = originalAlpha;
+            ownsClip = true;
+            ownsAlpha = true;
+        }
         apply(0f);
+        releaseOrigin();
         animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(editor ? 200 : 230);
-        animator.setInterpolator(new PathInterpolator(0.24f, 0f, 0.24f, 1f));
+        animator.setDuration(replyMotion != null ? BannerReplyMotion.OPEN_DURATION_MS
+                : morph != null ? 245 : editor ? 200 : 230);
+        animator.setInterpolator(replyMotion != null ? new LinearInterpolator()
+                : new PathInterpolator(0.24f, 0f, 0.24f, 1f));
         animator.addUpdateListener(animation -> apply((float) animation.getAnimatedValue()));
         animator.addListener(new AnimatorListenerAdapter() {
             @Override
@@ -79,6 +114,15 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
     }
 
     private void apply(float progress) {
+        if (replyMotion != null) {
+            replyMotion.render(progress, 1f);
+            return;
+        }
+        if (morph != null) {
+            morph.reset();
+            morph.morph(card, replyButton, 1f - progress, 0.48f + 0.52f * progress, position);
+            return;
+        }
         if (clipApplied && ownsClip && !Objects.equals(reveal, view.getClipBounds())) ownsClip = false;
         if (ownsClip) {
             int width = view.getWidth(), height = view.getHeight();
@@ -109,9 +153,19 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
         view.removeCallbacks(timeout);
     }
 
+    private void releaseOrigin() {
+        if (releaseOrigin == null) return;
+        card.removeCallbacks(releaseOrigin);
+        releaseOrigin.run();
+        releaseOrigin = null;
+    }
+
     private void finish() {
         if (finished) return;
         finished = true;
+        releaseOrigin();
+        if (replyMotion != null) replyMotion.finish();
+        if (morph != null) morph.reset();
         stopWaiting();
         view.removeOnAttachStateChangeListener(this);
         if (animator != null) {
