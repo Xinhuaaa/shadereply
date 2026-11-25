@@ -19,24 +19,29 @@ final class NotificationMedia {
     static final String PREVIEW = "io.shadereply.notification.MEDIA_PREVIEW";
     private static final int PREVIEW_HEIGHT_DP = 156;
     private static final float PREVIEW_SCALE = 0.70f;
-    private static final int MIN_DISPLAY_HEIGHT_DP = 44;
 
     static void install(XposedModule module, ClassLoader loader) throws ReflectiveOperationException {
         Class<?> image = loader.loadClass("com.android.internal.widget.MessagingImageMessage");
         Method bind = image.getDeclaredMethod("setMessage", Notification.MessagingStyle.Message.class, boolean.class);
         Method measure = image.getDeclaredMethod("onMeasure", int.class, int.class);
+        Method layout = image.getDeclaredMethod("onLayout", boolean.class, int.class, int.class, int.class, int.class);
+        Method measuredType = image.getDeclaredMethod("getMeasuredType");
         Method draw = image.getDeclaredMethod("onDraw", Canvas.class);
         Method recycle = image.getDeclaredMethod("recycle");
         Method setSize = View.class.getDeclaredMethod("setMeasuredDimension", int.class, int.class);
         Field isolated = image.getDeclaredField("mIsIsolated");
+        Field minImageHeight = image.getDeclaredField("mMinImageHeight");
         Field aspectRatio = image.getDeclaredField("mAspectRatio");
         Field drawable = image.getDeclaredField("mDrawable");
         bind.setAccessible(true);
         measure.setAccessible(true);
+        layout.setAccessible(true);
+        measuredType.setAccessible(true);
         draw.setAccessible(true);
         recycle.setAccessible(true);
         setSize.setAccessible(true);
         isolated.setAccessible(true);
+        minImageHeight.setAccessible(true);
         aspectRatio.setAccessible(true);
         drawable.setAccessible(true);
         Map<View, PreviewRender> previews = Collections.synchronizedMap(new WeakHashMap<>());
@@ -66,15 +71,43 @@ final class NotificationMedia {
             View view = (View) chain.getThisObject();
             PreviewRender preview = previews.get(view);
             if (preview == null || preview.resizeFailed) return result;
+            int nativeHeight = view.getMeasuredHeight();
             try {
-                if (!isolated.getBoolean(view)) {
+                boolean isolatedPreview = isolated.getBoolean(view);
+                int minimum = minImageHeight.getInt(view);
+                if (!isolatedPreview) {
                     measurePreview(view, aspectRatio.getFloat(view), (int) chain.getArg(0),
-                            (int) chain.getArg(1), setSize);
+                            (int) chain.getArg(1), minimum, setSize);
+                }
+                if (NotificationDiagnostics.isEnabled()) {
+                    int type = (int) measuredType.invoke(view);
+                    if (type != preview.measuredType || isolatedPreview != preview.measuredIsolated) {
+                        preview.measuredType = type;
+                        preview.measuredIsolated = isolatedPreview;
+                        NotificationDiagnostics.record(module, preview.trace, "systemui_media_measure",
+                                "isolated=" + isolatedPreview + " native_height=" + nativeHeight
+                                        + " height=" + view.getMeasuredHeight() + " width=" + view.getMeasuredWidth()
+                                        + " inline_minimum=" + minimum + " measured_type=" + type);
+                    }
                 }
             } catch (ReflectiveOperationException | RuntimeException failure) {
                 preview.resizeFailed = true;
                 NotificationDiagnostics.warn(module, preview.trace, "systemui_media_resize_failed",
                         "error=" + NotificationDiagnostics.errorType(failure));
+            }
+            return result;
+        });
+        module.hook(layout).intercept(chain -> {
+            Object result = chain.proceed();
+            if (NotificationDiagnostics.isEnabled()) {
+                View view = (View) chain.getThisObject();
+                PreviewRender preview = previews.get(view);
+                if (preview != null && !preview.laidOut) {
+                    preview.laidOut = true;
+                    NotificationDiagnostics.record(module, preview.trace, "systemui_media_layout",
+                            "attached=" + view.isAttachedToWindow() + " shown=" + view.isShown()
+                                    + " width=" + view.getWidth() + " height=" + view.getHeight());
+                }
             }
             return result;
         });
@@ -115,7 +148,8 @@ final class NotificationMedia {
 
     private static final class PreviewRender {
         final String trace;
-        boolean drawn, resizeFailed;
+        int measuredType = -1;
+        boolean measuredIsolated, laidOut, drawn, resizeFailed;
 
         PreviewRender(String trace) {
             this.trace = trace;
@@ -136,7 +170,8 @@ final class NotificationMedia {
                 && uri.getPathSegments().contains("shadereply-previews");
     }
 
-    private static void measurePreview(View view, float ratio, int widthSpec, int heightSpec, Method setSize)
+    private static void measurePreview(View view, float ratio, int widthSpec, int heightSpec,
+            int minimum, Method setSize)
             throws ReflectiveOperationException {
         if (ratio <= 0f || !Float.isFinite(ratio)) return;
         int widthMode = View.MeasureSpec.getMode(widthSpec);
@@ -153,9 +188,9 @@ final class NotificationMedia {
             width = view.getMeasuredWidth();
             height = view.getMeasuredHeight();
         }
-        if (width <= 0 || height <= 0) return;
-        // The messaging layout may hide an image measured below its minimum display height.
-        int minimum = Math.min(height, Math.round(MIN_DISPLAY_HEIGHT_DP * density));
+        // Leave undersized images at their native measurement. Android accepts a small
+        // image at its intrinsic height, but may hide it if we resize it below the minimum.
+        if (width <= 0 || height <= 0 || height < minimum) return;
         int scaledHeight = Math.max(minimum, Math.round(height * PREVIEW_SCALE));
         int scaledWidth = Math.max(1, Math.round(width * (scaledHeight / (float) height)));
         setSize.invoke(view, scaledWidth, scaledHeight);

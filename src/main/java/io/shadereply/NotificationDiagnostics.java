@@ -43,6 +43,10 @@ final class NotificationDiagnostics {
         return notification.extras.getString(REVISION);
     }
 
+    static boolean isEnabled() {
+        return enabled;
+    }
+
     static void record(XposedModule module, String id, String stage, String detail) {
         if (enabled) writeTrace(module, Log.INFO, id, stage, detail);
     }

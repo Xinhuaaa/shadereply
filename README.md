@@ -4,9 +4,9 @@
 
 [下载 APK](https://github.com/Xinhuaaa/shadereply/releases) · [源码许可](LICENSE) · [第三方许可](NOTICE.md)
 
-| 横幅下拉、上滑收起与关闭 | 横幅长按打开回复框 | 通知栏长按并发送回复 |
+| 横幅下拉、上滑收起与关闭 | 横幅长按打开回复框 | 通知栏长按打开回复框 |
 | --- | --- | --- |
-| <img src="docs/media/banner-reply.gif" width="246" alt="下拉横幅打开回复框，上滑收起，再次上滑关闭横幅"> | <img src="docs/media/banner-hold.gif" width="246" alt="长按顶部横幅打开回复框"> | <img src="docs/media/shade-reply.gif" width="246" alt="长按通知栏里的消息打开回复框并发送回复"> |
+| <img src="docs/media/banner-reply.gif" width="246" alt="下拉横幅打开回复框，上滑收起，再次上滑关闭横幅"> | <img src="docs/media/banner-hold.gif" width="246" alt="长按顶部横幅打开回复框"> | <img src="docs/media/shade-reply.gif" width="246" alt="长按通知栏里的消息打开回复框"> |
 
 *ColorOS 17 实机录屏，使用模拟聊天消息。白色圆点标出手指位置。*
 

@@ -64,7 +64,8 @@ internal object WeChatNotifications {
     private var attached = false
     private var loading = false
     private var loaded = false
-    private var app: Application? = null
+    @Volatile private var app: Application? = null
+    @Volatile private var notificationEntryReady = false
     private var preferenceListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     @Volatile private var settings = WeChatConfig()
     @Volatile private var reply: WeChatMethods.Reply? = null
@@ -105,6 +106,7 @@ internal object WeChatNotifications {
                 result
             }
             if (process == PACKAGE) hookActions(module, loader)
+            hookNotificationPosts(module)
             attached = true
             module.log(Log.INFO, TAG, "WeChat notification settings loaded ($process), enabled=${settings.enabled}", null)
         }.onFailure { module.log(Log.WARN, TAG, "Could not attach to WeChat ($process)", it) }
@@ -124,6 +126,12 @@ internal object WeChatNotifications {
         loading = true
         Thread({
             val installed = runCatching {
+                if (NotificationDiagnostics.isEnabled()) {
+                    val version = runCatching {
+                        context.packageManager.getPackageInfo(PACKAGE, 0).longVersionCode
+                    }.getOrNull()
+                    traceNotification(module, "wechat_hook_scan_started", "version_code=${version ?: "unknown"}")
+                }
                 System.loadLibrary("dexkit")
                 DexKitBridge.create(context.applicationInfo.sourceDir).use { dex ->
                     val deal = WeChatMethods.dealNotify(dex, loader)
@@ -133,7 +141,9 @@ internal object WeChatNotifications {
                     reply = runCatching { WeChatMethods.reply(dex, loader) }.getOrNull()
                     reading = runCatching { WeChatMethods.reading(dex, loader) }.getOrNull()
                     hookBubbleCancellation(module)
-                    hookNotifications(module, deal)
+                    hookNotificationEntry(module, deal)
+                    notificationEntryReady = true
+                    traceNotification(module, "wechat_hook_entry_installed", "")
                     media = runCatching {
                         WeChatMedia(dex, loader) { message, error -> module.log(Log.WARN, TAG, message, error) }
                             .also { hookMedia(module, it) }
@@ -189,7 +199,7 @@ internal object WeChatNotifications {
         }
     }
 
-    private fun hookNotifications(module: XposedModule, deal: Method) {
+    private fun hookNotificationEntry(module: XposedModule, deal: Method) {
         val messageField = deal.parameterTypes.first().declaredFields.firstOrNull {
             it.type.name.startsWith("com.tencent.mm.storage.") &&
                 generateSequence(it.type) { type -> type.superclass }.any { type ->
@@ -202,6 +212,11 @@ internal object WeChatNotifications {
             if (settings.enabled && !talker.isNullOrBlank()) {
                 val message = runCatching { messageField?.get(chain.getArg(0)) }.getOrNull()
                 currentTalker.set(Incoming(talker, chain.getArg(2) as? String ?: "", chain.getArg(3) as? Int ?: 0, message))
+                traceNotification(module, "wechat_notify_entry", "context_captured=true")
+            } else {
+                traceNotification(module, "wechat_notify_entry",
+                    if (settings.enabled) "context_captured=false reason=missing_conversation"
+                    else "context_captured=false reason=disabled")
             }
             try {
                 chain.proceed()
@@ -209,6 +224,9 @@ internal object WeChatNotifications {
                 if (parent == null) currentTalker.remove() else currentTalker.set(parent)
             }
         }
+    }
+
+    private fun hookNotificationPosts(module: XposedModule) {
         val notify = NotificationManager::class.java.getDeclaredMethod(
             "notify", String::class.java, Int::class.javaPrimitiveType, Notification::class.java)
         module.hook(notify).intercept { chain ->
@@ -216,24 +234,54 @@ internal object WeChatNotifications {
             val config = settings
             val context = app
             val notification = chain.getArg(2) as Notification
-            if (!config.enabled || incoming == null || context == null ||
-                notification.channelId != CHANNEL || notification.flags and Notification.FLAG_GROUP_SUMMARY != 0 ||
-                notification.extras.containsKey(REVISION) ||
-                notification.extras.containsKey("wekite.notification.CHAT_INTENT") ||
-                notification.extras.getString(Notification.EXTRA_TEMPLATE)?.endsWith("MessagingStyle") == true
-            ) return@intercept chain.proceed()
+            if (notification.extras.containsKey(REVISION)) return@intercept chain.proceed()
+            val skip = when {
+                notification.flags and Notification.FLAG_GROUP_SUMMARY != 0 -> "group_summary"
+                notification.channelId != CHANNEL -> "other_channel"
+                !config.enabled -> "disabled"
+                context == null -> "application_not_attached"
+                notification.extras.containsKey("wekite.notification.CHAT_INTENT") -> "wekite_already_enhanced"
+                notification.extras.getString(Notification.EXTRA_TEMPLATE)?.endsWith("MessagingStyle") == true ->
+                    "existing_messaging_style"
+                incoming == null && !notificationEntryReady -> "entry_hook_not_ready"
+                incoming == null -> "entry_context_missing"
+                else -> null
+            }
+            if (skip != null) {
+                traceNotification(module, "wechat_notify_skipped", "reason=$skip")
+                return@intercept chain.proceed()
+            }
+            checkNotNull(incoming)
+            checkNotNull(context)
             val tag = chain.getArg(0) as? String
             val id = chain.getArg(1) as Int
             val result = runCatching { enhance(module, context, config, notification, incoming, tag, id) }
                 .onFailure { Log.w(TAG, "Notification enhancement skipped (${it.javaClass.simpleName})") }
-                .getOrNull() ?: return@intercept chain.proceed()
+                .getOrNull()
+            if (result == null) {
+                traceNotification(module, "wechat_notify_skipped", "reason=enhancement_unavailable")
+                return@intercept chain.proceed()
+            }
             val posted = chain.proceed(arrayOf(tag, id, result))
+            if (NotificationDiagnostics.isEnabled()) {
+                val replyAvailable = result.actions.orEmpty().any { action ->
+                    action.remoteInputs.orEmpty().any { it.allowFreeFormInput }
+                }
+                traceNotification(module, "wechat_notify_enhanced", "type=${incoming.type} reply_action=$replyAvailable",
+                    NotificationDiagnostics.revision(result))
+            }
             if (incoming.type == 3 || incoming.type == 34 || incoming.type == 47 || incoming.type == 1048625) {
                 runCatching { addMediaPreview(module, context, config, incoming, tag, id, result) }
                     .onFailure { NotificationDiagnostics.warn(module, NotificationDiagnostics.revision(result),
                         "media_failed", "error=${NotificationDiagnostics.errorType(it)}") }
             }
             posted
+        }
+    }
+
+    private fun traceNotification(module: XposedModule, stage: String, detail: String, trace: String? = null) {
+        if (NotificationDiagnostics.isEnabled()) {
+            NotificationDiagnostics.record(module, trace, stage, "process=$process $detail")
         }
     }
 

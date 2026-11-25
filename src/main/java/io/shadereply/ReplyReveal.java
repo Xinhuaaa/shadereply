@@ -19,6 +19,7 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
 
     private final View view;
     private final boolean editor;
+    private final boolean pulled;
     private final View card;
     private final Rect replyButton;
     private final BannerCollapseContent.Layer morph;
@@ -38,18 +39,19 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
     private ValueAnimator animator;
 
     static void show(View view, boolean editor) {
-        show(view, editor, null, null, null);
+        show(view, editor, false);
     }
 
-    static void showEditor(View editor, View card, Rect replyButton) {
-        showEditor(editor, card, replyButton, null);
+    static void show(View view, boolean editor, boolean pulled) {
+        show(view, editor, null, null, null, pulled);
     }
 
-    static void showEditor(View editor, View card, Rect replyButton, Runnable releaseOrigin) {
-        show(editor, true, card, replyButton, releaseOrigin);
+    static void showEditor(View editor, View card, Rect replyButton, Runnable releaseOrigin, boolean pulled) {
+        show(editor, true, card, replyButton, releaseOrigin, pulled);
     }
 
-    private static void show(View view, boolean editor, View card, Rect replyButton, Runnable releaseOrigin) {
+    private static void show(View view, boolean editor, View card, Rect replyButton, Runnable releaseOrigin,
+                             boolean pulled) {
         if (view == null || !view.isAttachedToWindow() || !ValueAnimator.areAnimatorsEnabled()) {
             if (releaseOrigin != null) releaseOrigin.run();
             return;
@@ -59,7 +61,7 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
             if (releaseOrigin != null) releaseOrigin.run();
             return;
         }
-        ReplyReveal transition = new ReplyReveal(view, editor, card, replyButton);
+        ReplyReveal transition = new ReplyReveal(view, editor, card, replyButton, pulled);
         transition.releaseOrigin = releaseOrigin;
         running.put(view, new WeakReference<>(transition));
         view.addOnAttachStateChangeListener(transition);
@@ -74,9 +76,10 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
         if (transition != null) transition.finish();
     }
 
-    private ReplyReveal(View view, boolean editor, View card, Rect replyButton) {
+    private ReplyReveal(View view, boolean editor, View card, Rect replyButton, boolean pulled) {
         this.view = view;
         this.editor = editor;
+        this.pulled = pulled;
         this.card = card;
         this.replyButton = replyButton;
         replyMotion = BannerReplyMotion.create(card, view, replyButton);
@@ -98,8 +101,12 @@ final class ReplyReveal implements ViewTreeObserver.OnPreDrawListener, View.OnAt
         apply(0f);
         releaseOrigin();
         animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(replyMotion != null ? BannerReplyMotion.OPEN_DURATION_MS
-                : morph != null ? 245 : editor ? 200 : 230);
+        if (replyMotion != null) {
+            animator.setDuration(pulled ? BannerReplyMotion.PULL_OPEN_DURATION_MS : BannerReplyMotion.OPEN_DURATION_MS);
+        } else {
+            long duration = morph != null ? 245 : editor ? 200 : 230;
+            animator.setDuration(pulled ? duration * 4 / 5 : duration);
+        }
         animator.setInterpolator(replyMotion != null ? new LinearInterpolator()
                 : new PathInterpolator(0.24f, 0f, 0.24f, 1f));
         animator.addUpdateListener(animation -> apply((float) animation.getAnimatedValue()));

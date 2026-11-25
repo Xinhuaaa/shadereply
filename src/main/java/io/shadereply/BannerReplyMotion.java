@@ -21,6 +21,7 @@ import android.widget.TextView;
 
 final class BannerReplyMotion {
     static final long OPEN_DURATION_MS = 475;
+    static final long PULL_OPEN_DURATION_MS = 300;
     private static final PathInterpolator FIELD_EASING = new PathInterpolator(0.34f, 0f, 0.27f, 1f);
     private static final PathInterpolator SEND_EASING = new PathInterpolator(0.30f, 0.16f, 0.38f, 1.11f);
     private static final int DEFAULT_FIELD_COLOR = 0x29ffffff;

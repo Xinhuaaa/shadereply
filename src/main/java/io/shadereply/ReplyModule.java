@@ -59,7 +59,6 @@ public final class ReplyModule extends XposedModule {
     };
     private static final int OPEN_RETRIES = 8;
     private static final int BANNER_LAYOUT_RETRIES = 12;
-    private static final int MIN_PULL_MS = 85;
     private static final int MAX_COLLAPSE_DRAG_DP = 56;
     private static final float COLLAPSE_COMMIT_FRACTION = 0.60f;
 
@@ -104,6 +103,7 @@ public final class ReplyModule extends XposedModule {
         final long downTime;
         final boolean pullEnabled;
         final int holdMs;
+        final String trace;
         boolean handled;
         boolean cancelledNativeTouch;
         boolean pullCancelled;
@@ -116,12 +116,14 @@ public final class ReplyModule extends XposedModule {
         float peakY;
 
         NotificationGesture(Candidate target, MotionEvent down, GestureConfig settings, int pullDp) {
-            this(target.row(), target.notification().getKey(), down, settings, pullDp);
+            this(target.row(), target.notification().getKey(), down, settings, pullDp,
+                    NotificationDiagnostics.revision(target.notification().getNotification()));
         }
 
-        NotificationGesture(View row, String key, MotionEvent down, GestureConfig settings, int pullDp) {
+        NotificationGesture(View row, String key, MotionEvent down, GestureConfig settings, int pullDp, String trace) {
             this.row = row;
             this.key = key;
+            this.trace = trace;
             this.x = down.getRawX();
             this.y = down.getRawY();
             this.peakY = this.y;
@@ -141,8 +143,7 @@ public final class ReplyModule extends XposedModule {
         }
 
         boolean confirmsPull(MotionEvent event) {
-            return pullEnabled && event.getEventTime() - downTime >= MIN_PULL_MS
-                    && isDownwardPull(event, pullDistance);
+            return pullEnabled && isDownwardPull(event, pullDistance);
         }
 
         boolean reachesBannerThreshold(MotionEvent event) {
@@ -1336,10 +1337,10 @@ public final class ReplyModule extends XposedModule {
             if (!(replyLayout.get(banner) instanceof View holder) || holder.isShown()) return;
             GestureConfig settings = config;
             NotificationGesture started = new NotificationGesture(banner, action.key(), event,
-                    settings, settings.bannerDp());
+                    settings, settings.bannerDp(), null);
             started.hold = () -> guarded(() -> {
                 if (gesture == started && !started.handled) {
-                    started.handled = open(container, started);
+                    started.handled = open(container, started, false);
                     if (started.handled) new PullDeformation(container, banner).pulse();
                 }
             });
@@ -1352,7 +1353,7 @@ public final class ReplyModule extends XposedModule {
             guarded(() -> {
                 if (!matches(container, current.row, current.key)) return;
                 guarded(() -> resetTimeout(container));
-                current.handled = open(container, current);
+                current.handled = open(container, current, true);
                 if (current.handled) {
                     current.endMotion();
                 }
@@ -1383,7 +1384,8 @@ public final class ReplyModule extends XposedModule {
             handler.sendEmptyMessageDelayed(HIDE_BANNER_MESSAGE, dialogNotification.getBoolean(helper) ? 10_000 : 5_000);
         }
 
-        private boolean open(ViewGroup container, NotificationGesture current) throws ReflectiveOperationException {
+        private boolean open(ViewGroup container, NotificationGesture current, boolean pulled)
+                throws ReflectiveOperationException {
             if (!matches(container, current.row, current.key)
                     || !(replyLayout.get(current.row) instanceof View holder) || holder.isShown()) return false;
             if (current.row.getHeight() > 0)
@@ -1393,8 +1395,8 @@ public final class ReplyModule extends XposedModule {
                     || holder.getVisibility() != View.VISIBLE) return false;
             ReplyBackdrop backdrop = current.backdrop != null ? current.backdrop : ReplyBackdrop.forView(holder);
             if (backdrop != null) backdrop.keepForEditor(holder, holder::isShown);
-            if (bannerText.get(current.row) instanceof View history) ReplyReveal.show(history, false);
-            ReplyReveal.show(holder, true);
+            if (bannerText.get(current.row) instanceof View history) ReplyReveal.show(history, false, pulled);
+            ReplyReveal.show(holder, true, pulled);
             int request = ++requestId;
             current.row.postOnAnimation(() -> confirmVibration(current.row, editor, request, 4, true));
             log(Log.INFO, TAG, "Opened reply in the fullscreen banner", null);
@@ -1612,6 +1614,7 @@ public final class ReplyModule extends XposedModule {
     }
 
     private final class BannerHeightPreview implements View.OnAttachStateChangeListener {
+        private static final PathInterpolator OPEN_EASING = new PathInterpolator(0.20f, 0.52f, 0.30f, 1f);
         private final View row;
         private final int initial, expanded;
         private final BannerTemplateTransition templateTransition;
@@ -1619,6 +1622,7 @@ public final class ReplyModule extends XposedModule {
         private final Choreographer choreographer = Choreographer.getInstance();
         private final Choreographer.FrameCallback followFrame = this::onFrame;
         private int height, openingHeight;
+        private float openingElapsedMs, openingDurationMs;
         private float displayedHeight;
         private float targetHeight;
         private long lastFrameNanos;
@@ -1655,11 +1659,17 @@ public final class ReplyModule extends XposedModule {
         private void onFrame(long timeNanos) {
             frameQueued = false;
             if (closed || rewind != null) return;
-            float elapsedMs = lastFrameNanos == 0 ? 8f : Math.min(24f, (timeNanos - lastFrameNanos) / 1_000_000f);
+            float elapsedMs = lastFrameNanos == 0 ? 8f : Math.max(0f, (timeNanos - lastFrameNanos) / 1_000_000f);
             lastFrameNanos = timeNanos;
-            float blend = (float) (1d - Math.exp(-elapsedMs / 18f));
-            displayedHeight += (targetHeight - displayedHeight) * blend;
-            if (Math.abs(targetHeight - displayedHeight) < 0.5f) displayedHeight = targetHeight;
+            if (opening) {
+                openingElapsedMs += elapsedMs;
+                float fraction = Math.min(1f, openingElapsedMs / openingDurationMs);
+                displayedHeight = openingHeight + (expanded - openingHeight) * OPEN_EASING.getInterpolation(fraction);
+            } else {
+                float blend = (float) (1d - Math.exp(-Math.min(24f, elapsedMs) / 11f));
+                displayedHeight += (targetHeight - displayedHeight) * blend;
+                if (Math.abs(targetHeight - displayedHeight) < 0.5f) displayedHeight = targetHeight;
+            }
             renderHeight(Math.round(displayedHeight));
             if (closed) return;
             if (displayedHeight != targetHeight) {
@@ -1714,6 +1724,7 @@ public final class ReplyModule extends XposedModule {
                 // Keep the currently scheduled frame, including when the first move crossed the threshold.
                 opening = true;
                 openingHeight = height;
+                openingDurationMs = 45f + 45f * (1f - progressAt(height));
                 targetHeight = expanded;
                 queueFrame();
                 return;
@@ -1815,8 +1826,10 @@ public final class ReplyModule extends XposedModule {
                 NotificationGesture gesture = new NotificationGesture(target, event, settings,
                         settings.shadeDp());
                 gesture.hold = () -> {
-                    if (shadeGesture == gesture && !gesture.handled)
-                        gesture.handled = tryShadeReply(gesture.row, gesture.key);
+                    if (shadeGesture == gesture && !gesture.handled) {
+                        gesture.handled = tryShadeReply(gesture, false);
+                        if (!gesture.handled) recordShadeGestureEnd(gesture, "hold_target_unavailable");
+                    }
                 };
                 shadeGesture = gesture;
                 postHold(gesture);
@@ -1827,6 +1840,12 @@ public final class ReplyModule extends XposedModule {
         NotificationGesture gesture = shadeGesture;
         if (gesture == null) return chain.proceed();
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            if (!gesture.handled && action == MotionEvent.ACTION_UP && gesture.confirmsPull(event)) {
+                gesture.handled = tryShadeReply(gesture, true);
+                if (!gesture.handled) recordShadeGestureEnd(gesture, "pull_target_unavailable");
+            } else if (!gesture.handled && gesture.pullEnabled && gesture.isDownwardPull(event, gesture.slop)) {
+                recordShadeGestureEnd(gesture, action == MotionEvent.ACTION_CANCEL ? "cancelled" : "below_threshold");
+            }
             clearShadeGesture();
             if (!gesture.handled) return chain.proceed();
             if (gesture.cancelledNativeTouch) return true;
@@ -1845,10 +1864,14 @@ public final class ReplyModule extends XposedModule {
             main.removeCallbacks(gesture.hold);
         if (gesture.handled) return true;
         if (action != MotionEvent.ACTION_MOVE || !gesture.confirmsPull(event)
-                || !tryShadeReply(gesture.row, gesture.key)) return chain.proceed();
+                || !tryShadeReply(gesture, true)) return chain.proceed();
         gesture.handled = true;
         gesture.cancelledNativeTouch = true;
         return cancelNativeTouch(chain, event);
+    }
+
+    private void recordShadeGestureEnd(NotificationGesture gesture, String reason) {
+        NotificationDiagnostics.record(this, gesture.trace, "reply_gesture_ended", "surface=shade reason=" + reason);
     }
 
     private boolean cancelNativeTouch(Chain chain, MotionEvent event) throws Throwable {
@@ -1862,18 +1885,19 @@ public final class ReplyModule extends XposedModule {
         return true;
     }
 
-    private boolean tryShadeReply(View row, String expectedKey) {
+    private boolean tryShadeReply(NotificationGesture gesture, boolean pulled) {
         try {
+            View row = gesture.row;
             Candidate target = candidate(row);
             ViewGroup list = stack();
             if (target == null || remoteInputManager == null || list == null
                     || !shadeReady(list) || !isDescendantOf(row, list)) return false;
             String key = target.notification().getKey();
-            if (expectedKey != null && !expectedKey.equals(key)) return false;
+            if (!gesture.key.equals(key)) return false;
             int request = ++requestId;
             String trace = NotificationDiagnostics.revision(target.notification().getNotification());
             NotificationDiagnostics.record(this, trace, "reply_open_requested", "surface=shade request=" + request);
-            tryOpen(key, trace, request, 0);
+            tryOpen(key, trace, request, 0, pulled);
             return true;
         } catch (ReflectiveOperationException | RuntimeException error) {
             warn(error);
@@ -2008,6 +2032,7 @@ public final class ReplyModule extends XposedModule {
         final String key, trace;
         final int request = ++requestId;
         boolean expandedByGesture;
+        boolean pulled;
         Rect replyButton;
         Runnable releaseOrigin;
         BannerReplyMotion.PullOrigin pullOrigin;
@@ -2025,13 +2050,14 @@ public final class ReplyModule extends XposedModule {
 
         void trackPull(NotificationGesture pull) {
             if (pull == null) return;
+            pulled = true;
             backdrop = pull.backdrop;
         }
 
         void revealEditor(View editor) {
             Rect start = pullOrigin == null ? null : pullOrigin.currentBounds();
             ReplyReveal.showEditor(editor, row, start == null ? replyButton : start,
-                    start == null ? releaseOrigin : pullOrigin::finish);
+                    start == null ? releaseOrigin : pullOrigin::finish, pulled);
             pullOrigin = null;
             releaseOrigin = null;
         }
@@ -2169,7 +2195,7 @@ public final class ReplyModule extends XposedModule {
         if (reply == null) reply = new BannerReplyAttempt(target);
         reply.trackPull(pull);
         reply.watchEditor(editor);
-        ReplyReveal.showEditor(editor, target.row(), replyButton);
+        ReplyReveal.showEditor(editor, target.row(), replyButton, null, reply.pulled);
         vibrateOnEditorFrame(target.row(), editor, reply.request);
         reply.diagnostic("reply_opened", "surface=compact_banner");
         return true;
@@ -2212,7 +2238,8 @@ public final class ReplyModule extends XposedModule {
         return false;
     }
 
-    private void tryOpen(String key, String trace, int request, int attempt) {
+    private void tryOpen(String key, String trace, int request, int attempt, boolean pulled) {
+        long delay = attempt > 0 ? 75 : pulled ? 16 : 35;
         main.postDelayed(() -> {
             if (request != requestId) return;
             try {
@@ -2224,12 +2251,12 @@ public final class ReplyModule extends XposedModule {
                 }
                 Candidate current = shadeReady(list)
                         ? findRowBelow(list, new Rect(), key) : null;
-                if (current != null && openEditor(current)) {
+                if (current != null && openEditor(current, pulled)) {
                     NotificationDiagnostics.record(this, trace, "reply_opened", "surface=shade request=" + request);
                     return;
                 }
                 if (attempt < OPEN_RETRIES) {
-                    tryOpen(key, trace, request, attempt + 1);
+                    tryOpen(key, trace, request, attempt + 1, pulled);
                 } else {
                     NotificationDiagnostics.record(this, trace, "reply_open_failed",
                             "surface=shade reason=editor_unavailable request=" + request);
@@ -2237,10 +2264,10 @@ public final class ReplyModule extends XposedModule {
             } catch (ReflectiveOperationException | RuntimeException error) {
                 warn(error);
             }
-        }, attempt == 0 ? 35 : 75);
+        }, delay);
     }
 
-    private boolean openEditor(Candidate target) throws ReflectiveOperationException {
+    private boolean openEditor(Candidate target, boolean pulled) throws ReflectiveOperationException {
         Object layout = getLayout.invoke(target.row());
         if (layout == null) return false;
         View editor = (View) getEditor.invoke(layout);
@@ -2255,7 +2282,7 @@ public final class ReplyModule extends XposedModule {
         if (!showingHistory) revealHistory(expanded, editor);
         if (!activateEditor(control)) return false;
         watchEditorBackdrop(ReplyBackdrop.forView(editor), editor);
-        ReplyReveal.show(editor, true);
+        ReplyReveal.show(editor, true, pulled);
         vibrateOnEditorFrame(target.row(), editor, requestId);
         return true;
     }
