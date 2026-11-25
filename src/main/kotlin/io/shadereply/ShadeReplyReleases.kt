@@ -10,12 +10,22 @@ internal data class ShadeReplyRelease(
     val prerelease: Boolean,
     val notes: String,
     val page: String,
-    val apk: String?,
+    val apk: ShadeReplyApk?,
+)
+
+internal data class ShadeReplyApk(
+    val id: Long,
+    val name: String,
+    val version: String,
+    val url: String,
+    val size: Long,
+    val sha256: String?,
 )
 
 internal object ShadeReplyReleases {
     const val PROJECT = "https://github.com/Xinhuaaa/shadereply"
     private const val API = "https://api.github.com/repos/Xinhuaaa/shadereply/releases?per_page=30"
+    private val sha256Digest = Regex("sha256:([0-9a-f]{64})")
     private val versionTag = Regex("""v?(\d+)\.(\d+)\.(\d+)""")
 
     fun newerThan(installed: String): ShadeReplyRelease? {
@@ -42,15 +52,27 @@ internal object ShadeReplyReleases {
             ?.second ?: return null
         val tag = latest.getString("tag_name")
         val assets = latest.optJSONArray("assets") ?: JSONArray()
+        val expectedVersion = tag.removePrefix("v")
+        val expectedName = "ShadeReply-$expectedVersion.apk"
+        val expectedUrl = "$PROJECT/releases/download/$tag/$expectedName"
         val apk = (0 until assets.length()).asSequence().map { assets.getJSONObject(it) }
-            .filter { it.optString("name").endsWith(".apk", ignoreCase = true) }
-            .map { it.optString("browser_download_url") }
-            .firstOrNull { it.startsWith("$PROJECT/releases/download/$tag/") }
+            .firstOrNull { it.optString("name") == expectedName && it.optString("state") == "uploaded"
+                && it.optString("browser_download_url") == expectedUrl
+                && it.optLong("id") > 0 && it.optLong("size") > 0 }
+            ?.let { asset ->
+                val digest = sha256Digest.matchEntire(asset.optString("digest"))?.groupValues?.get(1)
+                ShadeReplyApk(asset.getLong("id"), expectedName, expectedVersion, expectedUrl, asset.getLong("size"), digest)
+            }
         return ShadeReplyRelease(
             tag, latest.optBoolean("prerelease"),
             latest.optString("body").take(12_000).trim(),
             "$PROJECT/releases/tag/$tag", apk,
         )
+    }
+
+    fun isNewer(candidate: String, installed: String): Boolean {
+        val current = version(installed) ?: return false
+        return version(candidate)?.let { it > current } == true
     }
 
     private fun version(value: String): Version? {

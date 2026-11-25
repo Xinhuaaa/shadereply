@@ -36,6 +36,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -89,6 +90,7 @@ class GestureSettingsActivity : ComponentActivity() {
     private enum class ModuleState(val label: String, val detail: String) {
         CHECKING("检查中", "正在读取模块状态"),
         INACTIVE("未激活", "请在 LSPosed 中启用模块，再重启作用域"),
+        NO_SCOPE("待激活", "请在 LSPosed 中勾选需要启用的应用"),
         PENDING("待激活", "重启作用域后加载模块"),
         RUNNING("已激活", "模块正在作用域中运行"),
         STALE("已激活", "重启作用域后加载新版"),
@@ -159,9 +161,30 @@ class GestureSettingsActivity : ComponentActivity() {
     @Composable
     private fun HomePage() {
         ActivationCard()
-        HoldSettings()
-        PullSettings()
-        WeChatSettings()
+        SettingsSection("回复手势") {
+            HoldSettings()
+            PullSettings()
+        }
+        SettingsSection("微信通知") { WeChatSettings() }
+        SettingsSection("模块管理") { ModuleSettings() }
+    }
+
+    @Composable
+    private fun SettingsSection(title: String, content: @Composable () -> Unit) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                title,
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 5.dp).semantics { heading() },
+                style = COUITheme.textStyles.subtitle,
+                color = COUITheme.colorScheme.onSurfaceVariantSummary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            content()
+        }
+    }
+
+    @Composable
+    private fun ModuleSettings() {
         Group {
             ArrowPreference(title = "测试通知", onClick = ::postTestNotification)
             RowDivider()
@@ -231,7 +254,7 @@ class GestureSettingsActivity : ComponentActivity() {
         val dark = isSystemInDarkTheme()
         val state = activation.state
         val running = state == ModuleState.RUNNING || state == ModuleState.STALE
-        val pending = state == ModuleState.PENDING
+        val pending = state == ModuleState.PENDING || state == ModuleState.NO_SCOPE
         val background = when {
             running -> if (dark) Color(0xFF195939) else Color(0xFF147648)
             pending -> if (dark) Color(0xFF4B361E) else Color(0xFFFFEDD5)
@@ -474,6 +497,7 @@ class GestureSettingsActivity : ComponentActivity() {
                     (WeChatNotifications.PACKAGE in scope && target.processName == "${WeChatNotifications.PACKAGE}:push")
             }
             when {
+                scope.isEmpty() -> ModuleState.NO_SCOPE
                 running.isEmpty() -> ModuleState.PENDING
                 running.any { it.loadedVersionCode != version.longVersionCode } -> ModuleState.STALE
                 else -> ModuleState.RUNNING

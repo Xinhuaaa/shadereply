@@ -3,6 +3,35 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.4.10"
 }
 
+abstract class CopyLicenseDocuments : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val documents: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val assets: DirectoryProperty
+
+    @get:javax.inject.Inject
+    abstract val files: FileSystemOperations
+
+    @TaskAction
+    fun copy() {
+        files.sync {
+            from(documents)
+            into(assets.dir("licenses"))
+        }
+    }
+}
+
+val copyLicenseDocuments by tasks.registering(CopyLicenseDocuments::class) {
+    documents.from("LICENSE", "NOTICE.md", fileTree("licenses"))
+    assets.set(layout.buildDirectory.dir("generated/assets/openSourceLicenses"))
+}
+
+androidComponents.onVariants { variant ->
+    variant.sources.assets?.addGeneratedSourceDirectory(copyLicenseDocuments, CopyLicenseDocuments::assets)
+}
+
 android {
     namespace = "io.shadereply"
     compileSdk {
@@ -14,8 +43,8 @@ android {
         applicationId = "io.shadereply"
         minSdk = 37
         targetSdk = 37
-        versionCode = 64
-        versionName = "0.1.63"
+        versionCode = 65
+        versionName = "0.1.64"
     }
     providers.gradleProperty("shadereplyDebugKeystore").orNull?.let { path ->
         signingConfigs.getByName("debug").storeFile = file(path)
