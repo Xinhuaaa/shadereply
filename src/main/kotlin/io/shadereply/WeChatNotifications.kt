@@ -45,9 +45,9 @@ internal object WeChatNotifications {
     private const val DISMISS = ACTION + "DISMISS"
     private const val TRANSCRIBE = ACTION + "TRANSCRIBE"
     private const val KEY_TEXT = ACTION + "TEXT"
-    private const val REVISION = ACTION + "REVISION"
+    private const val REVISION = NotificationDiagnostics.REVISION
     private const val CONVERSATION = ACTION + "CONVERSATION"
-    private const val MESSAGE_ID = ACTION + "MESSAGE_ID"
+    private const val MESSAGE_ID = NotificationDiagnostics.MESSAGE_ID
     private const val SHORTCUT_ICON_VERSION = ACTION + "ICON_VERSION"
     private const val HISTORY_LIMIT = 7
     private val messageCount = Regex("""^\[\d+条]\s*""")
@@ -228,7 +228,11 @@ internal object WeChatNotifications {
                 .onFailure { Log.w(TAG, "Notification enhancement skipped (${it.javaClass.simpleName})") }
                 .getOrNull() ?: return@intercept chain.proceed()
             val posted = chain.proceed(arrayOf(tag, id, result))
-            runCatching { addMediaPreview(module, context, config, incoming, tag, id, result) }
+            if (incoming.type == 3 || incoming.type == 34 || incoming.type == 47 || incoming.type == 1048625) {
+                runCatching { addMediaPreview(module, context, config, incoming, tag, id, result) }
+                    .onFailure { NotificationDiagnostics.warn(module, NotificationDiagnostics.revision(result),
+                        "media_failed", "error=${NotificationDiagnostics.errorType(it)}") }
+            }
             posted
         }
     }
@@ -258,16 +262,34 @@ internal object WeChatNotifications {
         module: XposedModule, context: Context, config: WeChatConfig,
         incoming: Incoming, tag: String?, id: Int, posted: Notification,
     ) {
-        val resolver = media ?: return
-        val postedMessage = messages(posted).lastOrNull() ?: return
-        val messageId = postedMessage.extras.getString(MESSAGE_ID) ?: return
-        fun attachment(type: String, uri: Uri) = updatePostedMessage(module, context, incoming.talker, tag, id, messageId) {
-            if (incoming.type == 3 && settings.imageMode == WeChatConfig.IMAGE_OFF) return@updatePostedMessage it
-            it.extras.putBoolean(NotificationMedia.PREVIEW, true)
-            it.setData(type, uri)
+        val messageId = messages(posted).lastOrNull()?.extras?.getString(MESSAGE_ID)
+        fun diagnostic(stage: String, detail: String) = NotificationDiagnostics.record(
+            module, messageId ?: NotificationDiagnostics.revision(posted), stage, "type=${incoming.type} $detail",
+        )
+        diagnostic("notification_posted", "source=wechat")
+        val resolver = media
+        val skip = when {
+            messageId == null -> "message_id_missing"
+            resolver == null -> "resolver_unavailable"
+            incoming.type == 3 && config.imageMode == WeChatConfig.IMAGE_OFF -> "image_preview_disabled"
+            incoming.type == 34 && !config.voiceText -> "voice_transcription_disabled"
+            incoming.type != 34 && !resolver.supportsType(incoming.type) -> "lookup_unavailable"
+            else -> null
         }
-        if (!resolver.supportsType(incoming.type) && incoming.type != 34) return
-        if (incoming.type == 34 && !config.voiceText) return
+        if (skip != null) {
+            diagnostic("media_skipped", "reason=$skip")
+            return
+        }
+        requireNotNull(messageId)
+        requireNotNull(resolver)
+        fun attachment(type: String, uri: Uri) {
+            diagnostic("media_uri_created", "format=$type")
+            updatePostedMessage(module, context, incoming.talker, tag, id, messageId) {
+                if (incoming.type == 3 && settings.imageMode == WeChatConfig.IMAGE_OFF) return@updatePostedMessage it
+                it.extras.putBoolean(NotificationMedia.PREVIEW, true)
+                it.setData(type, uri)
+            }
+        }
         val body = mediaBody(incoming.content)
         val message = incoming.message?.takeIf {
             resolver.talker.get(it) == incoming.talker && resolver.typeOf(it) == incoming.type &&
@@ -285,6 +307,7 @@ internal object WeChatNotifications {
         }
         if (incoming.type == 34) {
             if (message != null) {
+                diagnostic("voice_requested", "source=wechat")
                 val request = Intent(TRANSCRIBE).setComponent(ComponentName(PACKAGE, RECEIVER))
                     .putExtra("talker", incoming.talker).putExtra("tag", tag).putExtra("id", id)
                     .putExtra(MESSAGE_ID, messageId)
@@ -292,11 +315,17 @@ internal object WeChatNotifications {
                     .putExtra("voice_path", resolver.imagePath.get(message) as? String)
                 if (process == PACKAGE) main.post { requestTranscript(module, context, request) }
                 else context.sendBroadcast(request)
-            }
+            } else diagnostic("media_skipped", "reason=message_record_missing")
             return
         }
-        if (message == null && (incoming.type == 3 || WeChatMedia.stickerId(incoming.content) == null)) return
-        resolver.resolve(context, incoming.type, message, incoming.content, config, ::attachment)
+        if (message == null && (incoming.type == 3 || WeChatMedia.stickerId(incoming.content) == null)) {
+            diagnostic("media_skipped", "reason=message_record_missing")
+            return
+        }
+        diagnostic("media_queued", "record_available=${message != null}")
+        resolver.resolve(context, incoming.type, message, incoming.content, config, ::diagnostic,
+            warning = { stage, detail -> NotificationDiagnostics.warn(module, messageId, stage, detail) },
+            callback = ::attachment)
     }
 
     private fun requestTranscript(module: XposedModule, context: Context, intent: Intent) {
@@ -306,34 +335,46 @@ internal object WeChatNotifications {
         val tag = intent.getStringExtra("tag")
         val id = intent.getIntExtra("id", 0)
         val manager = context.getSystemService(NotificationManager::class.java)
-        val notification = active(manager, tag, id) ?: return
-        if (notification.extras.getString(CONVERSATION) != conversationId(talker) ||
-            messages(notification).none { it.extras.getString(MESSAGE_ID) == messageId }) return
+        val notification = active(manager, tag, id)
+        if (notification == null || notification.extras.getString(CONVERSATION) != conversationId(talker) ||
+            messages(notification).none { it.extras.getString(MESSAGE_ID) == messageId }) {
+            NotificationDiagnostics.record(module, messageId, "voice_skipped", "reason=notification_changed")
+            return
+        }
+        val transcriber = voice
+        if (transcriber == null) {
+            NotificationDiagnostics.record(module, messageId, "voice_skipped", "reason=transcriber_unavailable")
+            return
+        }
         runCatching {
-            voice?.transcribe(talker, intent.getLongExtra("local_id", 0), intent.getStringExtra("voice_path")) { transcript ->
+            transcriber.transcribe(talker, intent.getLongExtra("local_id", 0), intent.getStringExtra("voice_path")) { transcript ->
                 updatePostedMessage(module, context, talker, tag, id, messageId) { original ->
                     if (!settings.voiceText) original else Notification.MessagingStyle.Message(
                         "[语音] $transcript", original.timestamp, original.senderPerson,
                     ).apply { extras.putAll(original.extras) }
                 }
             }
-        }.onFailure { module.log(Log.WARN, TAG, "Voice transcription failed to start", it) }
+        }.onFailure {
+            NotificationDiagnostics.warn(module, messageId, "voice_failed", "error=${NotificationDiagnostics.errorType(it)}")
+        }
     }
 
     private fun updatePostedMessage(
         module: XposedModule, context: Context, talker: String, tag: String?, id: Int,
         messageId: String, update: (Notification.MessagingStyle.Message) -> Notification.MessagingStyle.Message,
     ) {
+        fun skipped(reason: String) = NotificationDiagnostics.record(module, messageId, "media_update_skipped", "reason=$reason")
         main.post {
-            if (!settings.enabled) return@post
+            if (!settings.enabled) return@post skipped("module_disabled")
             runCatching {
                 val manager = context.getSystemService(NotificationManager::class.java)
-                val notification = active(manager, tag, id)
-                    ?.takeIf { it.extras.getString(CONVERSATION) == conversationId(talker) } ?: return@runCatching
-                val revision = notification.extras.getString(REVISION) ?: return@runCatching
+                val notification = active(manager, tag, id) ?: return@runCatching skipped("row_missing")
+                if (notification.extras.getString(CONVERSATION) != conversationId(talker))
+                    return@runCatching skipped("row_replaced")
+                val revision = notification.extras.getString(REVISION) ?: return@runCatching skipped("revision_missing")
                 val messages = messages(notification).toMutableList()
                 val index = messages.indexOfFirst { it.extras.getString(MESSAGE_ID) == messageId }
-                if (index < 0) return@runCatching
+                if (index < 0) return@runCatching skipped("message_missing")
                 messages[index] = update(messages[index])
                 val builder = Notification.Builder.recoverBuilder(context, notification.clone())
                     .setOnlyAlertOnce(true).setStyle(Notification.MessagingStyle(self).apply {
@@ -344,8 +385,13 @@ internal object WeChatNotifications {
                 if (current(manager, tag, id, revision) != null) {
                     manager.notify(tag, id, builder.build())
                     synchronized(stateLock) { history[talker] = History(revision, messages) }
-                }
-            }.onFailure { module.log(Log.WARN, TAG, "Preview update skipped", it) }
+                    NotificationDiagnostics.record(module, messageId, "media_update_posted",
+                        "has_attachment=${messages[index].dataUri != null} index=$index count=${messages.size}")
+                } else skipped("revision_changed")
+            }.onFailure {
+                NotificationDiagnostics.warn(module, messageId, "media_update_failed",
+                    "error=${NotificationDiagnostics.errorType(it)}")
+            }
         }
     }
 
@@ -548,7 +594,7 @@ internal object WeChatNotifications {
         val text = if (intent.action == REPLY) {
             RemoteInput.getResultsFromIntent(intent)?.getCharSequence(KEY_TEXT)?.toString()
                 ?.takeIf(String::isNotBlank) ?: run {
-                    module.log(Log.WARN, TAG, "WeChat reply arrived without remote input", null)
+                    NotificationDiagnostics.warn(module, revision, "reply_rejected", "reason=remote_input_missing")
                     return
                 }
         } else null
@@ -556,7 +602,7 @@ internal object WeChatNotifications {
         if (text == null && current(manager, tag, id, revision) == null) return
         val pending = receiver.goAsync()
         val deadline = SystemClock.uptimeMillis() + 7_000
-        if (text != null) module.log(Log.INFO, TAG, "Received WeChat notification reply", null)
+        if (text != null) NotificationDiagnostics.record(module, revision, "reply_received", "source=wechat")
         main.post {
             performAction(module, context, manager, tag, id, revision, talker, text, deadline, pending::finish)
         }
@@ -582,14 +628,18 @@ internal object WeChatNotifications {
         }
         try {
             if (text != null) {
-                module.log(Log.INFO, TAG, "WeChat notification reply queue result: $result", null)
+                NotificationDiagnostics.record(module, revision, "reply_queue_result", "result=${result ?: "unavailable"}")
             }
             val latest = if (text == null) current(manager, tag, id, revision) else {
                 // A new message can replace the row while the user is typing. The reply still
                 // belongs to the original conversation, even if the row is no longer present.
                 val conversation = conversationId(talker)
                 active(manager, tag, id)?.takeIf { it.extras.getString(CONVERSATION) == conversation }
-            } ?: return
+            }
+            if (latest == null) {
+                if (text != null) NotificationDiagnostics.record(module, revision, "reply_refresh_skipped", "reason=row_changed")
+                return
+            }
             val latestRevision = latest.extras.getString(REVISION) ?: return
             if (result != WeChatMethods.ActionResult.DONE) {
                 manager.notify(tag, id, Notification.Builder.recoverBuilder(context, latest.clone())
@@ -603,7 +653,10 @@ internal object WeChatNotifications {
                 val messages = appendReply(prior, text, settings.clearHistory)
                 runCatching { reading?.mark(talker) }
                 val afterRead = active(manager, tag, id)
-                if (afterRead != null && afterRead.extras.getString(REVISION) != latestRevision) return
+                if (afterRead != null && afterRead.extras.getString(REVISION) != latestRevision) {
+                    NotificationDiagnostics.record(module, revision, "reply_refresh_skipped", "reason=revision_changed")
+                    return
+                }
                 val builder = Notification.Builder.recoverBuilder(context, latest.clone())
                     .setOnlyAlertOnce(true).setAutoCancel(true).setStyle(Notification.MessagingStyle(self).apply {
                         setGroupConversation(latest.extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION))
@@ -616,6 +669,8 @@ internal object WeChatNotifications {
                 }
                 synchronized(stateLock) { history[talker] = History(latestRevision, messages) }
                 manager.notify(tag, id, builder.build())
+                NotificationDiagnostics.record(module, revision, "reply_refresh_posted",
+                    "count=${messages.size} attachments=${messages.count { it.dataUri != null }}")
             }
         } finally {
             finish()

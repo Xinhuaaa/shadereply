@@ -76,6 +76,8 @@ class GestureSettingsActivity : ComponentActivity() {
     private var settings by mutableStateOf(GestureConfig.DEFAULT)
     private var savedWeChat by mutableStateOf(WeChatConfig())
     private var weChat by mutableStateOf(WeChatConfig())
+    private var savedDetailedLogging by mutableStateOf(false)
+    private var detailedLogging by mutableStateOf(false)
     private var activation by mutableStateOf(Activation(ModuleState.CHECKING))
     private var hiddenIcon by mutableStateOf(false)
     private var confirmRestart by mutableStateOf(false)
@@ -112,6 +114,8 @@ class GestureSettingsActivity : ComponentActivity() {
                 it.getInt("wechat_image_mode", WeChatConfig.IMAGE_THUMB), it.getBoolean("wechat_wait_sticker", true),
                 it.getBoolean("wechat_voice_text"))
         } ?: savedWeChat
+        savedDetailedLogging = DiagnosticSettings.readLocal(this)
+        detailedLogging = savedInstanceState?.getBoolean("detailed_logging", savedDetailedLogging) ?: savedDetailedLogging
         if (savedInstanceState?.getBoolean("confirm_restart") == true) {
             restartTargets = ScopeRestart(savedInstanceState.getBoolean("restart_system_ui"),
                 savedInstanceState.getBoolean("restart_wechat"))
@@ -131,7 +135,7 @@ class GestureSettingsActivity : ComponentActivity() {
         Scaffold(
             topBar = { TopAppBar(title = "通知快捷回复", showDivider = false) },
             bottomBar = {
-                if (settings != saved || weChat != savedWeChat) {
+                if (settings != saved || weChat != savedWeChat || detailedLogging != savedDetailedLogging) {
                     Column(Modifier.fillMaxWidth().navigationBarsPadding()
                         .padding(horizontal = 20.dp, vertical = 10.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -194,9 +198,16 @@ class GestureSettingsActivity : ComponentActivity() {
                 onCheckedChange = ::setLauncherHidden,
             )
             RowDivider()
+            SwitchPreference(
+                title = "详细日志记录", checked = detailedLogging,
+                summary = "用于复现图片预览和快捷回复问题，可从 LSPosed 导出日志",
+                onCheckedChange = { detailedLogging = it },
+            )
+            RowDivider()
             ArrowPreference(title = "恢复默认设置", onClick = {
                 settings = GestureConfig.DEFAULT
                 weChat = WeChatConfig()
+                detailedLogging = false
             })
             RowDivider()
             ArrowPreference(
@@ -448,6 +459,7 @@ class GestureSettingsActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("detailed_logging", detailedLogging)
         outState.putBoolean("wechat_enabled", weChat.enabled)
         outState.putBoolean("wechat_bubbles", weChat.bubbles)
         outState.putBoolean("wechat_hide_read", weChat.hideRead)
@@ -598,11 +610,16 @@ class GestureSettingsActivity : ComponentActivity() {
         val gestureSaved = settings == saved || settings.save(this)
         val changedWeChat = weChat != savedWeChat
         val weChatSaved = !changedWeChat || weChat.save(WeChatConfig.local(this))
+        val changedLogging = detailedLogging != savedDetailedLogging
+        val loggingSaved = !changedLogging || DiagnosticSettings.saveLocal(this, detailedLogging)
         if (gestureSaved) saved = settings
         if (weChatSaved) savedWeChat = weChat
+        if (loggingSaved) savedDetailedLogging = detailedLogging
+        val weChatSynced = !changedWeChat || !weChatSaved || module.syncWeChatSettings()
+        val loggingSynced = !changedLogging || !loggingSaved || module.syncDiagnosticSettings()
         when {
-            !gestureSaved || !weChatSaved -> toast("部分设置保存失败，请重试")
-            changedWeChat && !module.syncWeChatSettings() -> toast("设置已保存，连接 LSPosed 后同步")
+            !gestureSaved || !weChatSaved || !loggingSaved -> toast("部分设置保存失败，请重试")
+            !weChatSynced || !loggingSynced -> toast("设置已保存，连接 LSPosed 后同步")
             else -> toast("设置已保存")
         }
     }

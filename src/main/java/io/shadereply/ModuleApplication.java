@@ -24,6 +24,7 @@ public final class ModuleApplication extends Application implements XposedServic
         getMainExecutor().execute(() -> {
             service = connected;
             syncWeChatSettings();
+            syncDiagnosticSettings();
             if (connectionChanged != null) connectionChanged.run();
         });
     }
@@ -34,6 +35,18 @@ public final class ModuleApplication extends Application implements XposedServic
             service = null;
             if (connectionChanged != null) connectionChanged.run();
         });
+    }
+
+    boolean syncDiagnosticSettings() {
+        XposedService connected = service;
+        if (connected == null) return false;
+        try {
+            return connected.getRemotePreferences(DiagnosticSettings.GROUP).edit()
+                    .putBoolean(DiagnosticSettings.DETAILED, DiagnosticSettings.readLocal(this)).commit();
+        } catch (RuntimeException error) {
+            android.util.Log.w("ShadeReply", "Could not sync diagnostic settings", error);
+            return false;
+        }
     }
 
     boolean syncWeChatSettings() {

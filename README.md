@@ -82,6 +82,8 @@ Windows 可用 `gradlew.bat assembleDebug`。APK 位于 `build/outputs/apk/debug
 
 欢迎提交 Issue 和 PR。报告兼容性问题时，请附上手机型号、ColorOS 版本、ShadeReply 版本、LSPosed 框架版本、微信版本和复现步骤。分享日志前请遮盖聊天内容及个人信息。[Issues](https://github.com/Xinhuaaa/shadereply/issues) · [Pull Requests](https://github.com/Xinhuaaa/shadereply/pulls)
 
+复现前在「模块管理」开启「详细日志记录」并保存。复现后从 LSPosed 的「日志」页导出 ZIP，记录复现时间。该开关默认关闭。在模块日志中搜索 `ShadeReplyTrace`，同一个 `trace=` 可以串起微信的附件处理、通知更新和系统界面的图片绑定与绘制。追踪记录使用随机标识，只包含阶段、结果、尺寸和计数等诊断信息。
+
 ## 许可
 
 ShadeReply 采用 GNU GPL v3。微信相关接口适配参考 WeKite。第三方组件沿用各自的许可证，许可原文和版权声明也可在「关于 → 开源许可」离线查看。[GPL v3 原文](LICENSE) · [来源与许可](NOTICE.md)

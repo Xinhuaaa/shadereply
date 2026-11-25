@@ -4,7 +4,6 @@ import android.app.Notification;
 import android.graphics.Canvas;
 import android.graphics.drawable.AnimatedImageDrawable;
 import android.net.Uri;
-import android.util.Log;
 import android.view.View;
 import android.widget.ImageView;
 
@@ -12,7 +11,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.Map;
-import java.util.Set;
 import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedModule;
@@ -41,36 +39,51 @@ final class NotificationMedia {
         isolated.setAccessible(true);
         aspectRatio.setAccessible(true);
         drawable.setAccessible(true);
-        Set<View> expandedPreviews = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+        Map<View, PreviewRender> previews = Collections.synchronizedMap(new WeakHashMap<>());
         Map<ImageView, AnimatedImageDrawable> installedAnimations = new WeakHashMap<>();
 
         module.hook(bind).intercept(chain -> {
             View view = (View) chain.getThisObject();
-            expandedPreviews.remove(view);
-            Object result = chain.proceed();
-            if (Boolean.TRUE.equals(result) && chain.getArg(0) instanceof Notification.MessagingStyle.Message msg
-                    && isPreview(msg)) expandedPreviews.add(view);
-            return result;
+            previews.remove(view);
+            if (!(chain.getArg(0) instanceof Notification.MessagingStyle.Message msg) || !isPreview(msg)) {
+                return chain.proceed();
+            }
+            String trace = msg.getExtras().getString(NotificationDiagnostics.MESSAGE_ID);
+            try {
+                Object result = chain.proceed();
+                boolean bound = Boolean.TRUE.equals(result);
+                NotificationDiagnostics.record(module, trace, "systemui_media_bind", "success=" + bound);
+                if (bound) previews.put(view, new PreviewRender(trace));
+                return result;
+            } catch (Throwable failure) {
+                NotificationDiagnostics.warn(module, trace, "systemui_media_bind_failed",
+                        "error=" + NotificationDiagnostics.errorType(failure));
+                throw failure;
+            }
         });
         module.hook(measure).intercept(chain -> {
             Object result = chain.proceed();
             View view = (View) chain.getThisObject();
-            if (!expandedPreviews.contains(view)) return result;
+            PreviewRender preview = previews.get(view);
+            if (preview == null || preview.resizeFailed) return result;
             try {
                 if (!isolated.getBoolean(view)) {
                     measurePreview(view, aspectRatio.getFloat(view), (int) chain.getArg(0),
                             (int) chain.getArg(1), setSize);
                 }
             } catch (ReflectiveOperationException | RuntimeException failure) {
-                expandedPreviews.remove(view);
-                module.log(Log.WARN, "WeChatShadeReply", "Could not resize the message preview", failure);
+                preview.resizeFailed = true;
+                NotificationDiagnostics.warn(module, preview.trace, "systemui_media_resize_failed",
+                        "error=" + NotificationDiagnostics.errorType(failure));
             }
             return result;
         });
         module.hook(draw).intercept(chain -> {
             ImageView view = (ImageView) chain.getThisObject();
+            PreviewRender preview = previews.get(view);
+            boolean isolatedPreview = preview != null && view.isShown() && isolated.getBoolean(view);
             // The template draws its own drawable. Register animation with ImageView so it schedules redraws.
-            AnimatedImageDrawable animation = expandedPreviews.contains(view) && view.isShown() && !isolated.getBoolean(view)
+            AnimatedImageDrawable animation = preview != null && !preview.resizeFailed && view.isShown() && !isolatedPreview
                     && drawable.get(view) instanceof AnimatedImageDrawable imageDrawable ? imageDrawable : null;
             if (animation != null) {
                 if (installedAnimations.get(view) != animation) {
@@ -84,14 +97,29 @@ final class NotificationMedia {
             } else {
                 clearAnimation(view, installedAnimations.remove(view));
             }
-            return chain.proceed();
+            Object result = chain.proceed();
+            if (preview != null && !preview.drawn && view.isShown() && view.getWidth() > 0 && view.getHeight() > 0) {
+                preview.drawn = true;
+                NotificationDiagnostics.record(module, preview.trace, "systemui_media_draw",
+                        "isolated=" + isolatedPreview + " width=" + view.getWidth() + " height=" + view.getHeight());
+            }
+            return result;
         });
         module.hook(recycle).intercept(chain -> {
             ImageView view = (ImageView) chain.getThisObject();
-            expandedPreviews.remove(view);
+            previews.remove(view);
             clearAnimation(view, installedAnimations.remove(view));
             return chain.proceed();
         });
+    }
+
+    private static final class PreviewRender {
+        final String trace;
+        boolean drawn, resizeFailed;
+
+        PreviewRender(String trace) {
+            this.trace = trace;
+        }
     }
 
     private static void clearAnimation(ImageView view, AnimatedImageDrawable animation) {

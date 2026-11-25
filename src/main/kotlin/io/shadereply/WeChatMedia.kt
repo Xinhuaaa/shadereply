@@ -54,6 +54,7 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
 
     fun resolve(
         context: Context, messageType: Int, message: Any?, rawContent: String, config: WeChatConfig,
+        diagnostic: (String, String) -> Unit, warning: (String, String) -> Unit,
         callback: (String, Uri) -> Unit,
     ) {
         val isSticker = messageType != 3
@@ -67,26 +68,42 @@ internal class WeChatMedia(dex: DexKitBridge, loader: ClassLoader, private val r
                     ?: stickerId(rawContent)
                     ?: message?.let { (content.get(it) as? String)?.let(::stickerId) }
             } else null
-            if (isSticker && md5 == null) return@execute
+            if (isSticker && md5 == null) {
+                diagnostic("media_skipped", "reason=sticker_reference_missing")
+                return@execute
+            }
             var requestedSticker = false
+            var foundBytes = false
+            var decodeError: String? = null
 
             do {
                 val decoded = runCatching {
                     val bytes = if (!isSticker) {
                         image?.read(requireNotNull(message), serverId.getLong(message), path, config.imageMode)
                     } else sticker?.read(md5!!.lowercase())
-                    bytes?.let { decode(it, isSticker) }
-                }.getOrNull()
+                    bytes?.let {
+                        if (!foundBytes) {
+                            foundBytes = true
+                            diagnostic("media_cache_read", "bytes=${it.size}")
+                        }
+                        decode(it, isSticker)
+                    }
+                }.onFailure { decodeError = NotificationDiagnostics.errorType(it) }.getOrNull()
                 if (decoded != null) {
                     val (mime, payload) = decoded
+                    diagnostic("media_decoded", "format=$mime bytes=${payload.size}")
                     runCatching { storePreview(context, mime, payload, callback) }
-                        .onFailure { report("Could not publish the notification attachment", it) }
+                        .onFailure { warning("media_uri_failed", "error=${NotificationDiagnostics.errorType(it)}") }
                     return@execute
                 }
                 if (md5 != null && config.waitSticker && !requestedSticker) {
                     requestedSticker = runCatching { sticker?.request(md5.lowercase()) == true }.getOrDefault(false)
                 }
-                if (SystemClock.elapsedRealtime() >= deadline) return@execute
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    val reason = if (foundBytes) "decode_failed" else "cache_unavailable"
+                    diagnostic("media_timeout", "reason=$reason error=${decodeError ?: "-"}")
+                    return@execute
+                }
                 SystemClock.sleep(80)
             } while (true)
         }

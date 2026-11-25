@@ -252,6 +252,7 @@ public final class ReplyModule extends XposedModule {
     @Override
     public void onPackageReady(PackageReadyParam param) {
         if (WeChatNotifications.PACKAGE.equals(param.getPackageName())) {
+            NotificationDiagnostics.observe(this);
             WeChatNotifications.onPackageReady(this, param.getClassLoader());
             return;
         }
@@ -263,6 +264,7 @@ public final class ReplyModule extends XposedModule {
             return;
         }
         installed = true;
+        NotificationDiagnostics.observe(this);
         try {
             install(loader);
             log(Log.INFO, TAG, "ColorOS " + (sdk == 37 ? "17" : "16") + " hooks installed", null);
@@ -436,9 +438,9 @@ public final class ReplyModule extends XposedModule {
     }
 
     private record OpenReplyDrag(View surface, View card, BannerSwipeUp swipeUp, boolean preventDismiss,
-            Candidate reopen) {
+            Candidate reopen, boolean startedInEditor) {
         private OpenReplyDrag(View surface, View card, BannerSwipeUp swipeUp, boolean preventDismiss) {
-            this(surface, card, swipeUp, preventDismiss, null);
+            this(surface, card, swipeUp, preventDismiss, null, false);
         }
 
         private static final OpenReplyDrag KEEP_EDITOR_OPEN = new OpenReplyDrag(null, null, null, false);
@@ -453,7 +455,7 @@ public final class ReplyModule extends XposedModule {
         final Runnable releaseToNative = this::replayDown;
         MotionEvent down;
         PullDeformation deformation;
-        boolean swipingUp, cancelled;
+        boolean swipingUp, cancelled, watchingEditor;
 
         OpenReplyPull(View window, MotionEvent event, OpenReplyDrag target) {
             this.window = window;
@@ -464,13 +466,14 @@ public final class ReplyModule extends XposedModule {
             GestureConfig settings = config;
             reopen = target.reopen() == null ? null
                     : new NotificationGesture(target.reopen(), event, settings, settings.bannerDp());
-            down = MotionEvent.obtain(event);
+            watchingEditor = target.startedInEditor();
+            if (!watchingEditor) down = MotionEvent.obtain(event);
             window.addOnAttachStateChangeListener(this);
-            if (!target.preventDismiss())
+            if (!watchingEditor && !target.preventDismiss())
                 main.postAtTime(releaseToNative, event.getDownTime() + ViewConfiguration.getLongPressTimeout());
         }
 
-        boolean handle(MotionEvent event) {
+        boolean handle(Chain chain, MotionEvent event) throws Throwable {
             int action = event.getActionMasked();
             if (cancelled) {
                 if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) finish();
@@ -478,6 +481,20 @@ public final class ReplyModule extends XposedModule {
             }
             float dx = Math.abs(event.getRawX() - x);
             float dy = event.getRawY() - y;
+            if (watchingEditor) {
+                // Let taps and text selection reach the editor until a vertical upward drag wins.
+                if (action != MotionEvent.ACTION_MOVE || event.getPointerCount() != 1) {
+                    finish();
+                    return false;
+                }
+                if (-dy < slop || -dy <= dx * 1.55f) {
+                    if (dx > slop || dy > slop) finish();
+                    return false;
+                }
+                watchingEditor = false;
+                swipingUp = true;
+                cancelNativeTouch(chain, event);
+            }
             boolean pulling = config.pull() && target.card() != null
                     && event.getPointerCount() == 1 && dy > dx * 1.55f;
             if (down != null) {
@@ -575,11 +592,12 @@ public final class ReplyModule extends XposedModule {
         @Override public void onViewDetachedFromWindow(View view) { finish(); }
     }
 
-    private boolean handleOpenReplyPull(View window, MotionEvent event, OpenReplyTarget target) {
+    private boolean handleOpenReplyPull(Chain chain, View window, MotionEvent event, OpenReplyTarget target)
+            throws Throwable {
         if (replayingOpenReplyDown) return false;
         OpenReplyPull pull = openReplyPulls.get(window);
         if (event.getActionMasked() != MotionEvent.ACTION_DOWN)
-            return pull != null && pull.handle(event);
+            return pull != null && pull.handle(chain, event);
         if (pull != null) pull.finish();
         if (event.getPointerCount() != 1 || !unlocked(window)) return false;
         guarded(() -> {
@@ -587,14 +605,15 @@ public final class ReplyModule extends XposedModule {
             if (drag != null && (config.pull() || drag.swipeUp() != null || drag.preventDismiss()))
                 openReplyPulls.put(window, new OpenReplyPull(window, event, drag));
         });
-        return openReplyPulls.containsKey(window);
+        OpenReplyPull started = openReplyPulls.get(window);
+        return started != null && !started.watchingEditor;
     }
 
     private void installOpenReplyPulls(ClassLoader loader, Method childAtTouch) {
         guarded(() -> {
             Class<?> shade = loader.loadClass(SYSTEM_UI + ".shade.NotificationShadeWindowView");
             Method dispatch = method(shade, "dispatchTouchEvent", MotionEvent.class);
-            hook(dispatch).intercept(chain -> handleOpenReplyPull((View) chain.getThisObject(),
+            hook(dispatch).intercept(chain -> handleOpenReplyPull(chain, (View) chain.getThisObject(),
                     (MotionEvent) chain.getArg(0), (window, down) -> {
                         ViewGroup list = stack();
                         if (list == null || !list.isShown() || !isDescendantOf(list, window)) return null;
@@ -609,7 +628,7 @@ public final class ReplyModule extends XposedModule {
             Class<?> banner = loader.loadClass(OPLUS_HEADS_UP + "HeadsUpLayout");
             Method dispatch = method(banner, "dispatchTouchEvent", MotionEvent.class);
             Method getRow = method(banner, "getRow");
-            hook(dispatch).intercept(chain -> handleOpenReplyPull((View) chain.getThisObject(),
+            hook(dispatch).intercept(chain -> handleOpenReplyPull(chain, (View) chain.getThisObject(),
                     (MotionEvent) chain.getArg(0), (window, down) -> {
                         Object row = getRow.invoke(window);
                         return rowType.isInstance(row) ? protectOpenReply((View) row, down, true) : null;
@@ -622,14 +641,17 @@ public final class ReplyModule extends XposedModule {
         if (!touches(row, down) || privateRow.getBoolean(row)) return null;
         View editor = visibleEditor(row);
         boolean editing = editor != null && (boolean) isEditorActive.invoke(editor);
-        if (editing && touches(editor, down)) return null;
-        if (!animate) return editing ? OpenReplyDrag.KEEP_EDITOR_OPEN : null;
+        boolean insideEditor = editing && touches(editor, down);
+        if (!animate) return editing && !insideEditor ? OpenReplyDrag.KEEP_EDITOR_OPEN : null;
         BannerSwipeUp swipe = rowSwipeUp(row, true);
+        if (insideEditor) {
+            return swipe == null ? null : new OpenReplyDrag(row, row, swipe, true, null, true);
+        }
         boolean expanded = editor != null || expandedWhenPinned != null && expandedWhenPinned.getBoolean(row);
         if (expanded) {
             Candidate reopen = editing ? null : bannerCandidate(row, null);
             if (!editing && reopen == null) return null;
-            return new OpenReplyDrag(row, row, swipe, true, reopen);
+            return new OpenReplyDrag(row, row, swipe, true, reopen, false);
         }
         return swipe == null ? null : new OpenReplyDrag(null, null, swipe, false);
     }
@@ -1188,13 +1210,16 @@ public final class ReplyModule extends XposedModule {
         private Object dispatch(Chain chain) throws Throwable {
             ViewGroup container = (ViewGroup) chain.getThisObject();
             MotionEvent event = (MotionEvent) chain.getArg(0);
-            if (handleOpenReplyPull(container, event, (window, down) -> {
+            if (handleOpenReplyPull(chain, container, event, (window, down) -> {
                 if (!(bannerView.get(window) instanceof View banner) || !touches(banner, down)
                         || !(replyLayout.get(banner) instanceof View holder)) return null;
-                if (holder.isShown() && touches(holder, down)) return null;
                 BannerSwipeUp swipe = fullScreenSwipeUp(container, banner, holder);
-                return holder.isShown() ? new OpenReplyDrag(window, banner, swipe, true)
-                        : (swipe == null ? null : new OpenReplyDrag(null, null, swipe, false));
+                if (holder.isShown()) {
+                    boolean insideEditor = touches(holder, down);
+                    if (insideEditor && swipe == null) return null;
+                    return new OpenReplyDrag(window, banner, swipe, true, null, insideEditor);
+                }
+                return swipe == null ? null : new OpenReplyDrag(null, null, swipe, false);
             })) return true;
             int type = event.getActionMasked();
             if (type == MotionEvent.ACTION_DOWN) {
@@ -1598,7 +1623,8 @@ public final class ReplyModule extends XposedModule {
         private float targetHeight;
         private long lastFrameNanos;
         private boolean frameQueued;
-        private ValueAnimator settle;
+        private ValueAnimator rewind;
+        private Runnable afterOpening;
         private ReplyBackdrop backdrop;
         private boolean closed, opening, writingHeight;
 
@@ -1613,7 +1639,7 @@ public final class ReplyModule extends XposedModule {
         }
 
         void follow(float distance, float start, float threshold) {
-            if (closed || settle != null) return;
+            if (closed || opening || rewind != null) return;
             // Start at zero velocity, then approach the expanded height as the finger moves.
             float preview = 0.90f * bannerProgress(distance, start, threshold);
             targetHeight = initial + (expanded - initial) * preview;
@@ -1628,15 +1654,21 @@ public final class ReplyModule extends XposedModule {
 
         private void onFrame(long timeNanos) {
             frameQueued = false;
-            if (closed || settle != null) return;
+            if (closed || rewind != null) return;
             float elapsedMs = lastFrameNanos == 0 ? 8f : Math.min(24f, (timeNanos - lastFrameNanos) / 1_000_000f);
             lastFrameNanos = timeNanos;
             float blend = (float) (1d - Math.exp(-elapsedMs / 18f));
             displayedHeight += (targetHeight - displayedHeight) * blend;
             if (Math.abs(targetHeight - displayedHeight) < 0.5f) displayedHeight = targetHeight;
             renderHeight(Math.round(displayedHeight));
-            if (!closed && displayedHeight != targetHeight) queueFrame();
-            else lastFrameNanos = 0;
+            if (closed) return;
+            if (displayedHeight != targetHeight) {
+                queueFrame();
+            } else if (opening) {
+                close(true);
+            } else {
+                lastFrameNanos = 0;
+            }
         }
 
         private void stopFollowing() {
@@ -1677,26 +1709,28 @@ public final class ReplyModule extends XposedModule {
         }
 
         void finish(boolean committed) {
-            if (closed || settle != null) return;
-            stopFollowing();
-            opening = committed;
-            openingHeight = height;
-            int end = committed ? expanded : initial;
-            if (height == end || !row.isShown()) {
-                close(committed);
+            if (closed || opening || rewind != null) return;
+            if (committed) {
+                // Keep the currently scheduled frame, including when the first move crossed the threshold.
+                opening = true;
+                openingHeight = height;
+                targetHeight = expanded;
+                queueFrame();
                 return;
             }
-            // A fast pull can cross the threshold before the first follow frame.
-            renderHeight(height);
-            if (closed) return;
-            settle = ValueAnimator.ofInt(height, end);
-            settle.setDuration(committed ? 160 : 200);
-            settle.setInterpolator(new PathInterpolator(0.20f, 0.68f, 0.24f, 1f));
-            settle.addUpdateListener(animation -> renderHeight((int) animation.getAnimatedValue()));
-            settle.addListener(new AnimatorListenerAdapter() {
-                @Override public void onAnimationEnd(Animator animation) { close(committed); }
+            stopFollowing();
+            if (height == initial || !row.isShown()) {
+                close(false);
+                return;
+            }
+            rewind = ValueAnimator.ofInt(height, initial);
+            rewind.setDuration(200);
+            rewind.setInterpolator(new PathInterpolator(0.20f, 0.68f, 0.24f, 1f));
+            rewind.addUpdateListener(animation -> renderHeight((int) animation.getAnimatedValue()));
+            rewind.addListener(new AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(Animator animation) { close(false); }
             });
-            settle.start();
+            rewind.start();
         }
 
         void close(boolean committed) {
@@ -1705,10 +1739,10 @@ public final class ReplyModule extends XposedModule {
             stopFollowing();
             row.removeOnAttachStateChangeListener(this);
             if (bannerPreviews.get(row) == this) bannerPreviews.remove(row);
-            if (settle != null) {
-                settle.removeAllUpdateListeners();
-                settle.removeAllListeners();
-                settle.cancel();
+            if (rewind != null) {
+                rewind.removeAllUpdateListeners();
+                rewind.removeAllListeners();
+                rewind.cancel();
             }
             if (!committed && backdrop != null) backdrop.collapse();
             try {
@@ -1726,6 +1760,8 @@ public final class ReplyModule extends XposedModule {
                 if (committed) replyOrigin.waitForEditor();
                 else replyOrigin.finish();
             }
+            if (committed && afterOpening != null) afterOpening.run();
+            afterOpening = null;
         }
 
         @Override public void onViewAttachedToWindow(View view) {}
@@ -1834,7 +1870,10 @@ public final class ReplyModule extends XposedModule {
                     || !shadeReady(list) || !isDescendantOf(row, list)) return false;
             String key = target.notification().getKey();
             if (expectedKey != null && !expectedKey.equals(key)) return false;
-            tryOpen(key, ++requestId, 0);
+            int request = ++requestId;
+            String trace = NotificationDiagnostics.revision(target.notification().getNotification());
+            NotificationDiagnostics.record(this, trace, "reply_open_requested", "surface=shade request=" + request);
+            tryOpen(key, trace, request, 0);
             return true;
         } catch (ReflectiveOperationException | RuntimeException error) {
             warn(error);
@@ -1918,6 +1957,7 @@ public final class ReplyModule extends XposedModule {
                     && findBannerControl(target, expanded, expandedEditor) != null) {
                 if (expandedEditor.isShown() && (boolean) isEditorActive.invoke(expandedEditor)) return true;
                 BannerReplyAttempt reply = new BannerReplyAttempt(target);
+                reply.diagnostic("reply_open_requested", "surface=banner");
                 if (!expandedWhenPinned.getBoolean(row)) {
                     BannerHeightPreview preview = pull == null ? null : pull.bannerPreview;
                     boolean historyPreviewed = preview != null && !preview.closed;
@@ -1947,8 +1987,13 @@ public final class ReplyModule extends XposedModule {
                     if (!historyPreviewed) revealHistory(expanded, expandedEditor);
                 }
                 reply.trackPull(pull);
-                if (reply.backdrop != null && !bannerPreviews.containsKey(row)) reply.backdrop.expand();
-                awaitExpandedBanner(reply, 0);
+                BannerHeightPreview opening = bannerPreviews.get(row);
+                if (opening != null && opening.opening) {
+                    opening.afterOpening = () -> row.postOnAnimation(() -> openExpandedBanner(reply, 0));
+                } else {
+                    if (reply.backdrop != null) reply.backdrop.expand();
+                    awaitExpandedBanner(reply, 0);
+                }
                 return true;
             }
             return openCompactBanner(target, null, pull);
@@ -1960,7 +2005,7 @@ public final class ReplyModule extends XposedModule {
 
     private final class BannerReplyAttempt {
         final View row;
-        final String key;
+        final String key, trace;
         final int request = ++requestId;
         boolean expandedByGesture;
         Rect replyButton;
@@ -1971,6 +2016,11 @@ public final class ReplyModule extends XposedModule {
         BannerReplyAttempt(Candidate target) {
             row = target.row();
             key = target.notification().getKey();
+            trace = NotificationDiagnostics.revision(target.notification().getNotification());
+        }
+
+        void diagnostic(String stage, String detail) {
+            NotificationDiagnostics.record(ReplyModule.this, trace, stage, detail + " request=" + request);
         }
 
         void trackPull(NotificationGesture pull) {
@@ -2046,10 +2096,16 @@ public final class ReplyModule extends XposedModule {
     }
 
     private void awaitExpandedBanner(BannerReplyAttempt reply, int attempt) {
-        main.postDelayed(() -> guarded(() -> {
+        main.postDelayed(() -> openExpandedBanner(reply, attempt), attempt == 0 ? 16 : 32);
+    }
+
+    private void openExpandedBanner(BannerReplyAttempt reply, int attempt) {
+        guarded(() -> {
             View row = reply.row;
             Candidate target = bannerCandidate(row, reply.key);
             if (reply.request != requestId || target == null || !(boolean) isPinned.invoke(row)) {
+                reply.diagnostic("reply_open_skipped", "surface=banner reason="
+                        + (reply.request != requestId ? "superseded" : "notification_changed"));
                 reply.clearOrigin();
                 if (reply.backdrop != null) reply.backdrop.collapse();
                 return;
@@ -2072,7 +2128,7 @@ public final class ReplyModule extends XposedModule {
                     reply.watchEditor(editor);
                     reply.revealEditor(editor);
                     vibrateOnEditorFrame(row, editor, reply.request);
-                    log(Log.INFO, TAG, "Opened reply in the expanded banner", null);
+                    reply.diagnostic("reply_opened", "surface=expanded_banner");
                     return;
                 }
             } else if (attempt < BANNER_LAYOUT_RETRIES) {
@@ -2081,8 +2137,11 @@ public final class ReplyModule extends XposedModule {
             }
             reply.clearOrigin();
             reply.restoreHeight();
-            if (!openCompactBanner(target, reply, null) && reply.backdrop != null) reply.backdrop.collapse();
-        }), attempt == 0 ? 16 : 32);
+            if (!openCompactBanner(target, reply, null)) {
+                reply.diagnostic("reply_open_failed", "surface=banner reason=editor_unavailable");
+                if (reply.backdrop != null) reply.backdrop.collapse();
+            }
+        });
     }
 
     private ReplyControl findBannerControl(Candidate target, View template, View editor) {
@@ -2112,7 +2171,7 @@ public final class ReplyModule extends XposedModule {
         reply.watchEditor(editor);
         ReplyReveal.showEditor(editor, target.row(), replyButton);
         vibrateOnEditorFrame(target.row(), editor, reply.request);
-        log(Log.INFO, TAG, "Opened reply in the banner", null);
+        reply.diagnostic("reply_opened", "surface=compact_banner");
         return true;
     }
 
@@ -2153,19 +2212,28 @@ public final class ReplyModule extends XposedModule {
         return false;
     }
 
-    private void tryOpen(String key, int request, int attempt) {
+    private void tryOpen(String key, String trace, int request, int attempt) {
         main.postDelayed(() -> {
             if (request != requestId) return;
             try {
                 ViewGroup list = stack();
-                if (list == null || !unlocked(list)) return;
+                if (list == null || !unlocked(list)) {
+                    NotificationDiagnostics.record(this, trace, "reply_open_skipped",
+                            "surface=shade reason=shade_unavailable request=" + request);
+                    return;
+                }
                 Candidate current = shadeReady(list)
                         ? findRowBelow(list, new Rect(), key) : null;
                 if (current != null && openEditor(current)) {
-                    log(Log.INFO, TAG, "Opened reply in the notification shade", null);
+                    NotificationDiagnostics.record(this, trace, "reply_opened", "surface=shade request=" + request);
                     return;
                 }
-                if (attempt < OPEN_RETRIES) tryOpen(key, request, attempt + 1);
+                if (attempt < OPEN_RETRIES) {
+                    tryOpen(key, trace, request, attempt + 1);
+                } else {
+                    NotificationDiagnostics.record(this, trace, "reply_open_failed",
+                            "surface=shade reason=editor_unavailable request=" + request);
+                }
             } catch (ReflectiveOperationException | RuntimeException error) {
                 warn(error);
             }

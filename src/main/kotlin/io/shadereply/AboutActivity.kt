@@ -9,7 +9,17 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -37,8 +47,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -46,6 +58,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import io.github.suqi8.coui.kmp.basic.Card
 import io.github.suqi8.coui.kmp.basic.HorizontalDivider
@@ -66,6 +79,12 @@ import org.json.JSONException
 import java.io.IOException
 
 class AboutActivity : ComponentActivity() {
+    private sealed class Destination(val depth: Int) {
+        data object Overview : Destination(0)
+        data object LicenseList : Destination(1)
+        data class LicenseText(val file: String) : Destination(2)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -101,20 +120,70 @@ class AboutActivity : ComponentActivity() {
                 checking = false
             }
         }
-        BackHandler(showLicenses) {
-            if (license == null) showLicenses = false else license = null
+        val destination = if (showLicenses) {
+            license?.let { Destination.LicenseText(it) } ?: Destination.LicenseList
+        } else {
+            Destination.Overview
         }
-        if (showLicenses) {
-            LicensesPage(license, onSelect = { license = it }, onBack = {
-                if (license == null) showLicenses = false else license = null
-            })
-            return
+        val goBack = {
+            when {
+                license != null -> license = null
+                showLicenses -> showLicenses = false
+                else -> finish()
+            }
         }
+        BackHandler(showLicenses, onBack = goBack)
+        val aboutScroll = rememberScrollState()
+        val licenseListScroll = rememberScrollState()
+        val forwardDirection = if (LocalLayoutDirection.current == LayoutDirection.Ltr) 1 else -1
+        AnimatedContent(
+            targetState = destination,
+            modifier = Modifier.fillMaxSize().clipToBounds().background(COUITheme.colorScheme.surface),
+            transitionSpec = {
+                val forward = targetState.depth > initialState.depth
+                val direction = if (forward) forwardDirection else -forwardDirection
+                val easing = CubicBezierEasing(0.22f, 0.68f, 0.23f, 1f)
+                val enter = slideInHorizontally(tween(300, easing = easing)) {
+                    direction * it / if (forward) 3 else 8
+                } + fadeIn(tween(260, easing = easing))
+                val exit = slideOutHorizontally(tween(300, easing = easing)) {
+                    -direction * it / if (forward) 8 else 3
+                } + fadeOut(tween(220, easing = easing))
+                (enter togetherWith exit).apply { targetContentZIndex = if (forward) 1f else -1f }
+            },
+            label = "About navigation",
+        ) { page ->
+            when (page) {
+                Destination.Overview -> AboutOverview(installedVersion, checking, status, available, installer,
+                    aboutScroll, onCheck = {
+                        checking = true
+                        status = null
+                        request++
+                    }, onLicenses = { showLicenses = true })
+                Destination.LicenseList -> LicensesPage(null, licenseListScroll,
+                    onSelect = { license = it }, onBack = goBack)
+                is Destination.LicenseText -> LicensesPage(page.file, rememberScrollState(),
+                    onSelect = {}, onBack = goBack)
+            }
+        }
+    }
+
+    @Composable
+    private fun AboutOverview(
+        installedVersion: String,
+        checking: Boolean,
+        status: String?,
+        available: ShadeReplyRelease?,
+        installer: ShadeReplyInstaller,
+        scroll: ScrollState,
+        onCheck: () -> Unit,
+        onLicenses: () -> Unit,
+    ) {
         Scaffold(topBar = { TopAppBar(title = "关于", navigationIcon = { BackButton { finish() } }, showDivider = false) }) { insets ->
             Box(Modifier.fillMaxSize().padding(insets), contentAlignment = Alignment.TopCenter) {
                 Column(
                     modifier = Modifier.widthIn(max = 592.dp).fillMaxWidth()
-                        .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 20.dp),
+                        .verticalScroll(scroll).padding(horizontal = 16.dp, vertical = 20.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     Column(
@@ -136,18 +205,14 @@ class AboutActivity : ComponentActivity() {
                                 title = "检查更新", summary = if (checking) "正在查询 GitHub Releases…" else status,
                                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                                 enabled = !checking,
-                                onClick = {
-                                    checking = true
-                                    status = null
-                                    request++
-                                },
+                                onClick = onCheck,
                             )
                             HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                             ArrowPreference(title = "项目主页", summary = "Xinhuaaa/shadereply",
                                 onClick = { openLink(ShadeReplyReleases.PROJECT) })
                             HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                             ArrowPreference(title = "开源许可", summary = "GPL-3.0 · 第三方组件",
-                                onClick = { showLicenses = true })
+                                onClick = onLicenses)
                         }
                     }
                     available?.let { ReleaseCard(it, installer) }
@@ -264,7 +329,7 @@ class AboutActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun LicensesPage(selected: String?, onSelect: (String) -> Unit, onBack: () -> Unit) {
+    private fun LicensesPage(selected: String?, scroll: ScrollState, onSelect: (String) -> Unit, onBack: () -> Unit) {
         var contents by remember(selected) { mutableStateOf<String?>(null) }
         LaunchedEffect(selected) {
             if (selected != null) contents = withContext(Dispatchers.IO) {
@@ -273,7 +338,7 @@ class AboutActivity : ComponentActivity() {
             }
         }
         Scaffold(topBar = { TopAppBar(title = "开源许可", navigationIcon = { BackButton(onBack) }, showDivider = false) }) { insets ->
-            Column(Modifier.fillMaxSize().padding(insets).verticalScroll(rememberScrollState())
+            Column(Modifier.fillMaxSize().padding(insets).verticalScroll(scroll)
                 .padding(horizontal = 16.dp, vertical = 16.dp)) {
                 if (selected == null) {
                     Card(Modifier.fillMaxWidth()) {
