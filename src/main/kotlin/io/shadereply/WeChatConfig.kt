@@ -4,13 +4,13 @@ import android.content.Context
 import android.content.SharedPreferences
 
 internal data class WeChatConfig(
-    val enabled: Boolean = false,
-    val bubbles: Boolean = false,
+    val enabled: Boolean = true,
+    val bubbles: Boolean = true,
     val hideRead: Boolean = false,
     val clearHistory: Boolean = false,
     val imageMode: Int = IMAGE_THUMB,
     val waitSticker: Boolean = true,
-    val voiceText: Boolean = false,
+    val voiceText: Boolean = true,
 ) {
     fun save(prefs: SharedPreferences): Boolean = prefs.edit()
         .putBoolean("enabled", enabled)
@@ -31,14 +31,16 @@ internal data class WeChatConfig(
         fun local(context: Context): SharedPreferences =
             context.getSharedPreferences(GROUP, Context.MODE_PRIVATE)
 
+        private val defaults = WeChatConfig()
+
         fun read(prefs: SharedPreferences) = WeChatConfig(
-            prefs.getBoolean("enabled", false),
-            prefs.getBoolean("bubbles", false),
-            prefs.getBoolean("hide_read", false),
-            prefs.getBoolean("clear_history", false),
-            prefs.getInt("image_mode", IMAGE_THUMB).coerceIn(IMAGE_OFF, IMAGE_LARGE),
-            prefs.getBoolean("wait_sticker", true),
-            prefs.getBoolean("voice_text", false),
+            prefs.getBoolean("enabled", defaults.enabled),
+            prefs.getBoolean("bubbles", defaults.bubbles),
+            prefs.getBoolean("hide_read", defaults.hideRead),
+            prefs.getBoolean("clear_history", defaults.clearHistory),
+            prefs.getInt("image_mode", defaults.imageMode).coerceIn(IMAGE_OFF, IMAGE_LARGE),
+            prefs.getBoolean("wait_sticker", defaults.waitSticker),
+            prefs.getBoolean("voice_text", defaults.voiceText),
         )
     }
 }

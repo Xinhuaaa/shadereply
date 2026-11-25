@@ -12,7 +12,7 @@ record GestureConfig(boolean hold, int holdMs, boolean pull, int bannerDp, int s
     static final int HOLD_MIN = 350, HOLD_MAX = 1500;
     static final int BANNER_MIN = 16, BANNER_MAX = 96;
     static final int SHADE_MIN = 20, SHADE_MAX = 120;
-    static final GestureConfig DEFAULT = new GestureConfig(true, 650, true, 24, 42);
+    static final GestureConfig DEFAULT = new GestureConfig(true, 650, true, 45, 87);
 
     GestureConfig {
         holdMs = Math.max(HOLD_MIN, Math.min(HOLD_MAX, holdMs));
