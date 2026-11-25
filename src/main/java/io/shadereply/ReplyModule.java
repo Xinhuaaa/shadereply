@@ -80,7 +80,7 @@ public final class ReplyModule extends XposedModule {
             isEditorActive, defocusEditor, forceEditorDefocus, isHeadsUp, activate, isInputActive, setUserExpanded,
             isPinned, notifyHeightChanged, isShowingExpanded;
     private Field privateRow, headsUpEditor, editorText, stackController, stackView, stackExpanded, statusBarState;
-    private Field expandedWhenPinned;
+    private Field expandedWhenPinned, editorResetting, editorSending;
     private Method getActualHeight, getMaxContentHeight, getHeadsUpHeight, setActualHeight,
             setSwipingToExpand, isGroupSummary, removeHeadsUp;
     private Method removeHeadsUpWithoutAnimation;
@@ -307,6 +307,8 @@ public final class ReplyModule extends XposedModule {
         getEditor = method(content, "getExpandedRemoteInput");
         getHeadsUpChild = method(content, "getHeadsUpChild");
         isEditorActive = method(editor, "isActive");
+        guarded(() -> editorResetting = field(editor, "mResetting"));
+        guarded(() -> editorSending = field(editor, "mSending"));
         editorText = field(editor, "mEditText");
         defocusEditor = method(editorText.getType(), "defocusIfNeeded", boolean.class);
         guarded(() -> forceEditorDefocus = method(editor, "onDefocus", boolean.class, boolean.class, Runnable.class));
@@ -433,7 +435,12 @@ public final class ReplyModule extends XposedModule {
         OpenReplyDrag find(View window, MotionEvent down) throws ReflectiveOperationException;
     }
 
-    private record OpenReplyDrag(View surface, View card, BannerSwipeUp swipeUp, boolean preventDismiss) {
+    private record OpenReplyDrag(View surface, View card, BannerSwipeUp swipeUp, boolean preventDismiss,
+            Candidate reopen) {
+        private OpenReplyDrag(View surface, View card, BannerSwipeUp swipeUp, boolean preventDismiss) {
+            this(surface, card, swipeUp, preventDismiss, null);
+        }
+
         private static final OpenReplyDrag KEEP_EDITOR_OPEN = new OpenReplyDrag(null, null, null, false);
     }
 
@@ -442,6 +449,7 @@ public final class ReplyModule extends XposedModule {
         final OpenReplyDrag target;
         final float x, y;
         final int slop;
+        final NotificationGesture reopen;
         final Runnable releaseToNative = this::replayDown;
         MotionEvent down;
         PullDeformation deformation;
@@ -453,6 +461,9 @@ public final class ReplyModule extends XposedModule {
             x = event.getRawX();
             y = event.getRawY();
             slop = ViewConfiguration.get(window.getContext()).getScaledTouchSlop();
+            GestureConfig settings = config;
+            reopen = target.reopen() == null ? null
+                    : new NotificationGesture(target.reopen(), event, settings, settings.bannerDp());
             down = MotionEvent.obtain(event);
             window.addOnAttachStateChangeListener(this);
             if (!target.preventDismiss())
@@ -499,13 +510,33 @@ public final class ReplyModule extends XposedModule {
                     else finish();
                 }
             } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                if (action == MotionEvent.ACTION_UP) reopenEditorOnPull(event);
                 finish();
             } else if (action == MotionEvent.ACTION_MOVE && event.getPointerCount() == 1
-                    && target.surface() != null) {
+                    && target.surface() != null && !reopenEditorOnPull(event)) {
                 if (deformation == null) deformation = new PullDeformation(target.surface(), target.card());
                 deformation.follow(pulling ? dy : 0f);
+            } else if (action == MotionEvent.ACTION_POINTER_DOWN && reopen != null) {
+                reopen.pullCancelled = true;
             }
             return true;
+        }
+
+        private boolean reopenEditorOnPull(MotionEvent event) {
+            if (reopen == null) return false;
+            if (reopen.handled) return true;
+            if (!reopen.pullEnabled || reopen.pullCancelled || !reopen.isDownwardPull(event, reopen.pullDistance))
+                return false;
+            reopen.handled = tryBannerReply(reopen.row, reopen.key);
+            if (reopen.handled) {
+                if (deformation != null) {
+                    deformation.release();
+                    deformation = null;
+                }
+                if (headsUpTimeout != null && rowHeadsUpManager != null)
+                    guarded(() -> headsUpTimeout.reset(rowHeadsUpManager.get(reopen.row), reopen.key));
+            }
+            return reopen.handled;
         }
 
         private void discardDown() {
@@ -590,11 +621,16 @@ public final class ReplyModule extends XposedModule {
             throws ReflectiveOperationException {
         if (!touches(row, down) || privateRow.getBoolean(row)) return null;
         View editor = visibleEditor(row);
-        if (editor != null && touches(editor, down)) return null;
-        if (!animate) return editor == null ? null : OpenReplyDrag.KEEP_EDITOR_OPEN;
+        boolean editing = editor != null && (boolean) isEditorActive.invoke(editor);
+        if (editing && touches(editor, down)) return null;
+        if (!animate) return editing ? OpenReplyDrag.KEEP_EDITOR_OPEN : null;
         BannerSwipeUp swipe = rowSwipeUp(row, true);
         boolean expanded = editor != null || expandedWhenPinned != null && expandedWhenPinned.getBoolean(row);
-        if (expanded) return new OpenReplyDrag(row, row, swipe, true);
+        if (expanded) {
+            Candidate reopen = editing ? null : bannerCandidate(row, null);
+            if (!editing && reopen == null) return null;
+            return new OpenReplyDrag(row, row, swipe, true, reopen);
+        }
         return swipe == null ? null : new OpenReplyDrag(null, null, swipe, false);
     }
 
@@ -1880,7 +1916,7 @@ public final class ReplyModule extends XposedModule {
             View expandedEditor = (View) getEditor.invoke(layout);
             if (expandedWhenPinned != null && (boolean) isPinned.invoke(row)
                     && findBannerControl(target, expanded, expandedEditor) != null) {
-                if ((boolean) isEditorActive.invoke(expandedEditor)) return true;
+                if (expandedEditor.isShown() && (boolean) isEditorActive.invoke(expandedEditor)) return true;
                 BannerReplyAttempt reply = new BannerReplyAttempt(target);
                 if (!expandedWhenPinned.getBoolean(row)) {
                     BannerHeightPreview preview = pull == null ? null : pull.bannerPreview;
@@ -2026,7 +2062,7 @@ public final class ReplyModule extends XposedModule {
             View expanded = layout == null ? null : (View) getChild.invoke(layout);
             View editor = layout == null ? null : (View) getEditor.invoke(layout);
             ReplyControl control = findBannerControl(target, expanded, editor);
-            if (control != null && expanded.isShown()) {
+            if (control != null && expanded.isShown() && !editorIsFinishingSend(editor)) {
                 if ((boolean) isEditorActive.invoke(editor)) {
                     reply.clearOrigin();
                     reply.watchEditor(editor);
@@ -2063,8 +2099,8 @@ public final class ReplyModule extends XposedModule {
         View editor = (View) headsUpEditor.get(layout);
         if (child == null || !child.isShown()) return false;
         ReplyControl control = findBannerControl(target, child, editor);
-        if (control == null) return false;
-        if ((boolean) isEditorActive.invoke(editor)) {
+        if (control == null || editorIsFinishingSend(editor)) return false;
+        if (editor.isShown() && (boolean) isEditorActive.invoke(editor)) {
             if (reply != null) reply.watchEditor(editor);
             return true;
         }
@@ -2140,8 +2176,8 @@ public final class ReplyModule extends XposedModule {
         Object layout = getLayout.invoke(target.row());
         if (layout == null) return false;
         View editor = (View) getEditor.invoke(layout);
-        if (editor == null) return false;
-        if ((boolean) isEditorActive.invoke(editor)) return true;
+        if (editor == null || editorIsFinishingSend(editor)) return false;
+        if (editor.isShown() && (boolean) isEditorActive.invoke(editor)) return true;
         View expanded = (View) getChild.invoke(layout);
         if (expanded == null || !expanded.isAttachedToWindow()) return false;
         ReplyControl control = findReplyControl(expanded, editor, target.replies());
@@ -2211,6 +2247,11 @@ public final class ReplyModule extends XposedModule {
             }
         }
         return null;
+    }
+
+    private boolean editorIsFinishingSend(View editor) throws IllegalAccessException {
+        return (editorResetting != null && editorResetting.getBoolean(editor))
+                || (editorSending != null && editor.isShown() && editorSending.getBoolean(editor));
     }
 
     private View activeEditor(View row) throws ReflectiveOperationException {
