@@ -1,6 +1,6 @@
 # ShadeReply · 通知快捷回复
 
-适用于 ColorOS 17 的独立 LSPosed 模块。长按或下拉一条支持 Android 原生文字回复的通知，可以直接在顶部横幅或通知栏打开回复框。
+面向 ColorOS 的独立 LSPosed 模块，已在 ColorOS 17 上验证。长按或下拉一条支持 Android 原生文字回复的通知，可以直接在顶部横幅或通知栏打开回复框。
 
 [下载 APK](https://github.com/Xinhuaaa/shadereply/releases) · [源码许可](LICENSE) · [第三方许可](NOTICE.md)
 
@@ -25,7 +25,7 @@
 
 ## 安装与作用域
 
-需要 **ColorOS 17（Android API 37）** 和提供 **Modern Xposed API 102** 的 LSPosed。模块包名为 `io.shadereply`。
+APK 最低安装版本为 **Android 16（API 36）**。启用模块需要支持 **Modern Xposed API 102** 的 LSPosed。模块包名为 `io.shadereply`。
 
 1. 从 [GitHub Releases](https://github.com/Xinhuaaa/shadereply/releases) 下载 APK 并安装。
 2. 在 LSPosed 的模块列表里启用「通知快捷回复」，按需勾选下表中的作用域。
@@ -63,6 +63,7 @@
 
 - 按通知是否提供 Android 原生自由文本回复动作判断，适用于符合条件的微信及其他应用通知。
 - 横幅和通知栏显示的消息历史取决于应用随通知提供的内容。
+- ColorOS 17 已验证横幅和通知栏的回复手势。ColorOS 16 为试用支持，横幅、通知栏和全屏应用内的手势仍待实机验证。
 - 微信通知进化已核对微信 8.0.78 的接口。其他微信版本、其他 ColorOS 版本及其他 ROM 的兼容性以实测为准。
 
 ## 构建

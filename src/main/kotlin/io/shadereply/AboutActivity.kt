@@ -127,7 +127,7 @@ class AboutActivity : ComponentActivity() {
                             Image(painterResource(R.drawable.module_icon_foreground), null, Modifier.fillMaxSize())
                         }
                         Text("通知快捷回复", style = COUITheme.textStyles.title3, fontWeight = FontWeight.SemiBold)
-                        Text("v$installedVersion · ColorOS 17", style = COUITheme.textStyles.subtitle,
+                        Text("v$installedVersion", style = COUITheme.textStyles.subtitle,
                             color = COUITheme.colorScheme.onSurfaceVariantSummary)
                     }
                     Card(Modifier.fillMaxWidth()) {

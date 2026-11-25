@@ -34,12 +34,12 @@ import android.widget.TextView;
 import java.util.WeakHashMap;
 
 final class BannerTemplateTransition extends Drawable implements View.OnAttachStateChangeListener {
-    private static final int APP_NAME = 0x01020248;
-    private static final int MESSAGE_TEXT = 0x010205b3;
-    private static final int CONVERSATION_TEXT = 0x010202e7;
-    private static final int HEADER_TEXT_SECONDARY = 0x01020382;
-    private static final int MESSAGING_CONTENT = 0x0102047a;
-    private static final int MESSAGE_LINE = 0x0102041d;
+    private static final int APP_NAME = NotificationResources.id("app_name_text");
+    private static final int MESSAGE_TEXT = NotificationResources.id("text");
+    private static final int CONVERSATION_TEXT = NotificationResources.id("conversation_text");
+    private static final int HEADER_TEXT_SECONDARY = NotificationResources.id("header_text_secondary");
+    private static final int MESSAGING_CONTENT = NotificationResources.id("notification_messaging");
+    private static final int MESSAGE_LINE = NotificationResources.id("message_text");
     private static final int MAX_SNAPSHOT_PIXELS = 420_000;
     private static final ArgbEvaluator COLORS = new ArgbEvaluator();
     private static final WeakHashMap<View, BannerTemplateTransition> active = new WeakHashMap<>();

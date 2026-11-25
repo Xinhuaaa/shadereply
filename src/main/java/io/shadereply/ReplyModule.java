@@ -46,11 +46,17 @@ public final class ReplyModule extends XposedModule {
     private static final String TAG = "WeChatShadeReply";
     private static final String SYSTEM_UI = "com.android.systemui";
     private static final String OPLUS_HEADS_UP = "com.oplus.systemui.notification.headsup.windowframe.";
-    private static final int REMOTE_INPUT_TAG = 0x010204f5;
-    private static final int ACTION_INDEX_TAG = 0x0102046b;
-    private static final int NOTIFICATION_CONTENT = 0x01020592;
-    private static final int ACTIONS_CONTAINER_LAYOUT = 0x01020203;
-    private static final int[] HISTORY_CONTENT = {0x0102047a, 0x010202e7, 0x01020277, 0x01020471};
+    private static final String OPLUS_NOTIFICATION_CONTENT =
+            "com.oplus.systemui.statusbar.notification.row.NotificationContentViewExtImp";
+    private static final String OPLUS_HEADS_UP_TOUCH = OPLUS_HEADS_UP + "OplusHeadsUpTouchHelper";
+    private static final int REMOTE_INPUT_TAG = NotificationResources.id("remote_input_tag");
+    private static final int ACTION_INDEX_TAG = NotificationResources.id("notification_action_index_tag");
+    private static final int NOTIFICATION_CONTENT = NotificationResources.id("status_bar_latest_event_content");
+    private static final int ACTIONS_CONTAINER_LAYOUT = NotificationResources.id("actions_container_layout");
+    private static final int[] HISTORY_CONTENT = {
+        NotificationResources.id("notification_messaging"), NotificationResources.id("conversation_text"),
+        NotificationResources.id("big_text"), NotificationResources.id("notification_main_column")
+    };
     private static final int OPEN_RETRIES = 8;
     private static final int BANNER_LAYOUT_RETRIES = 12;
     private static final int MIN_PULL_MS = 85;
@@ -249,15 +255,32 @@ public final class ReplyModule extends XposedModule {
             WeChatNotifications.onPackageReady(this, param.getClassLoader());
             return;
         }
-        if (installed || !param.isFirstPackage() || !SYSTEM_UI.equals(param.getPackageName())
-                || Build.VERSION.SDK_INT != 37) return;
+        if (installed || !param.isFirstPackage() || !SYSTEM_UI.equals(param.getPackageName())) return;
+        ClassLoader loader = param.getClassLoader();
+        int sdk = Build.VERSION.SDK_INT;
+        if (sdk != 37 && (sdk != Build.VERSION_CODES.BAKLAVA || !hasColorOsSystemUi(loader))) {
+            log(Log.INFO, TAG, "SystemUI hooks skipped for SDK " + sdk, null);
+            return;
+        }
         installed = true;
         try {
-            install(param.getClassLoader());
-            log(Log.INFO, TAG, "ColorOS 17 hooks installed", null);
-        } catch (ReflectiveOperationException | RuntimeException error) {
-            log(Log.WARN, TAG, "SystemUI methods unavailable", error);
+            install(loader);
+            log(Log.INFO, TAG, "ColorOS " + (sdk == 37 ? "17" : "16") + " hooks installed", null);
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+            log(Log.WARN, TAG, "SystemUI methods unavailable on SDK " + sdk, error);
         }
+    }
+
+    private static boolean hasColorOsSystemUi(ClassLoader loader) {
+        for (String name : new String[] {OPLUS_NOTIFICATION_CONTENT, OPLUS_HEADS_UP_TOUCH}) {
+            try {
+                Class.forName(name, false, loader);
+                return true;
+            } catch (ClassNotFoundException | LinkageError ignored) {
+                // ColorOS builds can include different notification extensions.
+            }
+        }
+        return false;
     }
 
     private void install(ClassLoader loader) throws ReflectiveOperationException {
@@ -273,7 +296,11 @@ public final class ReplyModule extends XposedModule {
         Class<?> controller = loader.loadClass(notification + "stack.NotificationStackScrollLayoutController");
         Class<?> stack = loader.loadClass(notification + "stack.NotificationStackScrollLayout");
 
-        getEntry = method(rowType, "getEntry");
+        try {
+            getEntry = method(rowType, "getEntry");
+        } catch (NoSuchMethodException unavailable) {
+            getEntry = method(rowType, "getEntryLegacy");
+        }
         getSbn = method(entry, "getSbn");
         getLayout = method(rowType, "getPrivateLayout");
         getChild = method(content, "getExpandedChild");
@@ -336,7 +363,11 @@ public final class ReplyModule extends XposedModule {
 
         try {
             isPinned = method(rowType, "isPinned");
-            notifyHeightChanged = method(rowType, "notifyHeightChanged", String.class, boolean.class);
+            try {
+                notifyHeightChanged = method(rowType, "notifyHeightChanged", String.class, boolean.class);
+            } catch (NoSuchMethodException unavailable) {
+                notifyHeightChanged = method(rowType, "notifyHeightChanged", boolean.class);
+            }
             expandedWhenPinned = field(rowType, "mExpandedWhenPinned");
             getHeadsUpHeight = method(rowType, "getHeadsUpHeight");
             rowHeadsUpManager = field(rowType, "mHeadsUpManager");
@@ -363,9 +394,15 @@ public final class ReplyModule extends XposedModule {
                 }
                 return chain.proceed();
             });
-            setSwipingToExpand = method(rowType, "setUserSwipingToExpandRow", boolean.class);
             isGroupSummary = method(rowType, "isSummaryWithChildren");
-            swipingToExpand = field(rowType, "mIsUserSwipingToExpandRow");
+            try {
+                setSwipingToExpand = method(rowType, "setUserSwipingToExpandRow", boolean.class);
+                swipingToExpand = field(rowType, "mIsUserSwipingToExpandRow");
+            } catch (NoSuchMethodException | NoSuchFieldException unavailable) {
+                if (Build.VERSION.SDK_INT != Build.VERSION_CODES.BAKLAVA) throw unavailable;
+                setSwipingToExpand = method(rowType, "setUserLocked", boolean.class);
+                swipingToExpand = field(rowType, "mUserLocked");
+            }
             log(Log.INFO, TAG, "ColorOS banner drag preview available", null);
         } catch (ReflectiveOperationException | RuntimeException error) {
             log(Log.WARN, TAG, "Banner height preview unavailable", error);
@@ -383,7 +420,7 @@ public final class ReplyModule extends XposedModule {
         }
         installHistoryExpandClick(loader);
         installBanner(loader, SYSTEM_UI + ".statusbar.notification.headsup.HeadsUpTouchHelper");
-        installBanner(loader, OPLUS_HEADS_UP + "OplusHeadsUpTouchHelper");
+        installBanner(loader, OPLUS_HEADS_UP_TOUCH);
         try {
             new FullScreenReply(loader, entry);
             log(Log.INFO, TAG, "ColorOS fullscreen banner hooks installed", null);
@@ -623,9 +660,9 @@ public final class ReplyModule extends XposedModule {
                         // ColorOS restores the actions on the currently visible template only.
                         setRemoteInputVisible.invoke(layout, false);
                     }
-                    notifyHeightChanged.invoke(row, "ShadeReply collapse pinned banner", false);
+                    notifyBannerHeight(row, "ShadeReply collapse pinned banner", false);
                 } else if (interruptsOpening && current.getAsBoolean()) {
-                    notifyHeightChanged.invoke(row, "ShadeReply resume pinned expansion", true);
+                    notifyBannerHeight(row, "ShadeReply resume pinned expansion", true);
                 }
             }
         };
@@ -1647,7 +1684,7 @@ public final class ReplyModule extends XposedModule {
                 guarded(() -> setSwipingToExpand.invoke(row, false));
             }
             if (committed && row.isAttachedToWindow())
-                guarded(() -> notifyHeightChanged.invoke(row, "QuickReply.expandPinnedBanner", true));
+                guarded(() -> notifyBannerHeight(row, "QuickReply.expandPinnedBanner", true));
             if (templateTransition != null) templateTransition.finish();
             if (replyOrigin != null) {
                 if (committed) replyOrigin.waitForEditor();
@@ -1956,11 +1993,19 @@ public final class ReplyModule extends XposedModule {
                 preview.finish(true);
             } else {
                 // Use the same height change that ColorOS uses for the pinned expand button.
-                notifyHeightChanged.invoke(row, "QuickReply.expandPinnedBanner", true);
+                notifyBannerHeight(row, "QuickReply.expandPinnedBanner", true);
             }
         } catch (ReflectiveOperationException | RuntimeException error) {
             expandedWhenPinned.setBoolean(row, previous);
             throw error;
+        }
+    }
+
+    private void notifyBannerHeight(View row, String reason, boolean animate) throws ReflectiveOperationException {
+        if (notifyHeightChanged.getParameterCount() == 2) {
+            notifyHeightChanged.invoke(row, reason, animate);
+        } else {
+            notifyHeightChanged.invoke(row, animate);
         }
     }
 
