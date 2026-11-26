@@ -26,8 +26,10 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
     private View watchedView;
     private BooleanSupplier editorOpen;
     private ValueAnimator animation;
+    private ValueAnimator swipeRestore;
     private float animationTarget;
     private float progress;
+    private float swipeVisibility = 1f;
     private int appliedRadius;
     private boolean closed;
 
@@ -45,6 +47,10 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
         return backdrop;
     }
 
+    static ReplyBackdrop activeForView(View view) {
+        return ACTIVE_WINDOWS.get(view.getRootView());
+    }
+
     private ReplyBackdrop(View window, WindowManager manager, LayoutParams attrs) {
         this.window = window;
         this.manager = manager;
@@ -54,8 +60,12 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
     }
 
     float startDrag(View row) {
+        float visibleProgress = progress * swipeVisibility;
         stopWatchingView();
         stopAnimation();
+        stopSwipeRestore();
+        swipeVisibility = 1f;
+        setProgress(visibleProgress);
         watchedView = row;
         if (row != window) row.addOnAttachStateChangeListener(this);
         return progress;
@@ -63,6 +73,44 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
 
     void drag(float fraction) {
         setProgress(Math.max(0f, Math.min(1f, fraction)));
+    }
+
+    float progress() {
+        return progress;
+    }
+
+    View editorView() {
+        return editorOpen == null ? null : watchedView;
+    }
+
+    void setSwipeVisibility(float visibility) {
+        stopSwipeRestore();
+        swipeVisibility = visibility;
+        setProgress(progress);
+    }
+
+    void restoreAfterSwipe() {
+        if (closed || editorOpen == null || swipeVisibility == 1f) return;
+        if (!ValueAnimator.areAnimatorsEnabled()) {
+            setSwipeVisibility(1f);
+            return;
+        }
+        stopSwipeRestore();
+        swipeRestore = ValueAnimator.ofFloat(swipeVisibility, 1f);
+        swipeRestore.setDuration(160);
+        swipeRestore.setInterpolator(EASE_OUT);
+        swipeRestore.addUpdateListener(frame -> {
+            if (editorOpen == null || !editorOpen.getAsBoolean()) {
+                collapse();
+                return;
+            }
+            swipeVisibility = (float) frame.getAnimatedValue();
+            setProgress(progress);
+        });
+        swipeRestore.addListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator ended) { swipeRestore = null; }
+        });
+        swipeRestore.start();
     }
 
     void expand() {
@@ -80,6 +128,7 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
     }
 
     void collapse() {
+        stopSwipeRestore();
         stopWatchingView();
         animateTo(0f, 200);
     }
@@ -118,7 +167,7 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
         if (closed) return;
         progress = value;
         if (!(window.getLayoutParams() instanceof LayoutParams attrs)) return;
-        int nextRadius = Math.round(radius * value);
+        int nextRadius = Math.round(radius * value * swipeVisibility);
         boolean blur = nextRadius > 0 || originalFlag;
         if (nextRadius == 0) nextRadius = originalRadius;
         boolean hasBlur = (attrs.flags & BLUR_FLAG) != 0;
@@ -146,6 +195,14 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
         animation = null;
     }
 
+    private void stopSwipeRestore() {
+        if (swipeRestore == null) return;
+        swipeRestore.removeAllListeners();
+        swipeRestore.removeAllUpdateListeners();
+        swipeRestore.cancel();
+        swipeRestore = null;
+    }
+
     private void stopWatchingView() {
         if (watchedView == null) return;
         if (watchedView != window) watchedView.removeOnAttachStateChangeListener(this);
@@ -160,6 +217,7 @@ final class ReplyBackdrop implements View.OnAttachStateChangeListener, ViewTreeO
     private void close() {
         if (closed) return;
         stopAnimation();
+        stopSwipeRestore();
         stopWatchingView();
         setProgress(0f);
         closed = true;

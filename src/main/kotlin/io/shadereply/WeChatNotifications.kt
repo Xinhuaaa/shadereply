@@ -50,6 +50,8 @@ internal object WeChatNotifications {
     private const val MESSAGE_ID = NotificationDiagnostics.MESSAGE_ID
     private const val SHORTCUT_ICON_VERSION = ACTION + "ICON_VERSION"
     private const val HISTORY_LIMIT = 7
+    private const val TEXT_MESSAGE = 1
+    private const val QUOTED_MESSAGE = 822083633
     private val messageCount = Regex("""^\[\d+条]\s*""")
     private val groupSender = Regex("""^(.{1,80}?)[：:]\s+([\s\S]+)$""")
     private val groupAccount = Regex("""^([a-zA-Z0-9_@.\-]{1,100}):\n""")
@@ -468,7 +470,25 @@ internal object WeChatNotifications {
             }.build()
         val now = System.currentTimeMillis()
         val whenPosted = source.`when`.takeIf { it in 1..now + 60_000 } ?: now
-        val message = Notification.MessagingStyle.Message(sender?.groupValues?.get(2) ?: body, whenPosted, participant)
+        val messageText = sender?.groupValues?.get(2) ?: body
+        val preview = when (incoming.type) {
+            TEXT_MESSAGE -> WeChatEmoji.forNotification(messageText) {
+                val resolver = media
+                val record = incoming.message
+                val storedText = if (resolver != null && record != null) {
+                    runCatching {
+                        if (resolver.typeOf(record) == TEXT_MESSAGE && resolver.talker.get(record) == talker) {
+                            resolver.content.get(record) as? String
+                        } else null
+                    }.getOrNull()
+                } else null
+                val rawText = storedText?.takeIf(String::isNotBlank) ?: incoming.content
+                if (group) groupAccount.replaceFirst(rawText, "") else rawText
+            }
+            QUOTED_MESSAGE -> WeChatEmoji.forNotification(messageText)
+            else -> messageText
+        }
+        val message = Notification.MessagingStyle.Message(preview, whenPosted, participant)
         val conversation = conversationId(talker)
         val revision = UUID.randomUUID().toString()
         message.extras.putString(MESSAGE_ID, revision)

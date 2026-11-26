@@ -114,6 +114,8 @@ public final class ReplyModule extends XposedModule {
         ReplyBackdrop backdrop;
         BannerSwipeUp swipeUp;
         float peakY;
+        float sidewaysStart = -1f;
+        float sidewaysBlur;
 
         NotificationGesture(Candidate target, MotionEvent down, GestureConfig settings, int pullDp) {
             this(target.row(), target.notification().getKey(), down, settings, pullDp,
@@ -179,12 +181,27 @@ public final class ReplyModule extends XposedModule {
         }
 
         void updatePull(MotionEvent event) {
-            float distance = !pullCancelled && isDownwardPull(event, slop) ? event.getRawY() - y : 0f;
-            if (bannerPreview != null) bannerPreview.follow(distance, previewStart, pullDistance);
-            if (deformation != null) {
-                deformation.followBannerDrag(distance - previewStart);
-                if (backdrop != null) backdrop.drag(bannerProgress(distance, previewStart, pullDistance));
+            boolean downward = !pullCancelled && isDownwardPull(event, slop);
+            float distance = downward ? event.getRawY() - y : 0f;
+            float horizontalDistance = Math.abs(event.getRawX() - x);
+            boolean sideways = !downward && !pullCancelled && event.getPointerCount() == 1
+                    && horizontalDistance > slop && event.getRawY() >= y - slop;
+            if (bannerPreview != null) bannerPreview.follow(distance, previewStart, pullDistance, sideways);
+            if (deformation != null) deformation.followBannerDrag(distance - previewStart);
+            if (!sideways) sidewaysStart = -1f;
+            if (backdrop != null) {
+                if (sideways) followSidewaysBlur(horizontalDistance);
+                else if (deformation != null) backdrop.drag(bannerProgress(distance, previewStart, pullDistance));
             }
+        }
+
+        private void followSidewaysBlur(float horizontalDistance) {
+            float clearDistance = sidewaysBlurEnd(row);
+            if (sidewaysStart < 0f) {
+                sidewaysBlur = backdrop.progress();
+                sidewaysStart = Math.min(horizontalDistance, Math.max(0f, clearDistance - slop));
+            }
+            backdrop.drag(sidewaysBlur * sidewaysBlurVisibility(horizontalDistance, sidewaysStart, clearDistance, slop));
         }
 
         void endMotion() {
@@ -220,6 +237,19 @@ public final class ReplyModule extends XposedModule {
             }
             return true;
         }
+    }
+
+    private static float sidewaysBlurEnd(View card) {
+        float width = card.getMeasuredWidth();
+        float density = card.getResources().getDisplayMetrics().density;
+        // ColorOS uses half the row width up to 450 dp and 60% above it.
+        return 0.80f * width * (width <= 450f * density ? 0.50f : 0.60f);
+    }
+
+    private static float sidewaysBlurVisibility(float displacement, float start, float end, int slop) {
+        float travel = Math.max(slop, end - start);
+        float fraction = Math.max(0f, Math.min(1f, (displacement - start) / travel));
+        return 1f - fraction * fraction * (3f - 2f * fraction);
     }
 
     private static float bannerProgress(float distance, float start, float threshold) {
@@ -593,9 +623,69 @@ public final class ReplyModule extends XposedModule {
         @Override public void onViewDetachedFromWindow(View view) { finish(); }
     }
 
+    private final WeakHashMap<View, EditorSideSwipe> editorSideSwipes = new WeakHashMap<>();
+
+    private final class EditorSideSwipe {
+        private final float downX, downY;
+        private final int slop;
+        private float verticalAnchor, clearDistance;
+        private ReplyBackdrop backdrop;
+
+        EditorSideSwipe(View window, MotionEvent down) {
+            downX = down.getRawX();
+            downY = verticalAnchor = down.getRawY();
+            slop = ViewConfiguration.get(window.getContext()).getScaledTouchSlop();
+        }
+
+        void move(View window, MotionEvent event) {
+            float dx = Math.abs(event.getRawX() - downX);
+            if (backdrop == null) {
+                if (dx <= slop) {
+                    verticalAnchor = event.getRawY();
+                    return;
+                }
+                if (dx <= Math.abs(event.getRawY() - verticalAnchor)) return;
+                ReplyBackdrop candidate = ReplyBackdrop.activeForView(window);
+                View editor = candidate == null ? null : candidate.editorView();
+                if (editor == null || !editor.isShown()) return;
+                View card = editor;
+                while (!rowType.isInstance(card) && card.getParent() instanceof View parent && parent != window)
+                    card = parent;
+                int[] position = new int[2];
+                card.getLocationOnScreen(position);
+                if (downX < position[0] || downX >= position[0] + card.getWidth()
+                        || downY < position[1] || downY >= position[1] + card.getHeight()) return;
+                clearDistance = sidewaysBlurEnd(card);
+                backdrop = candidate;
+            }
+            backdrop.setSwipeVisibility(sidewaysBlurVisibility(dx, slop, clearDistance, slop));
+        }
+
+        void finish() {
+            if (backdrop != null) backdrop.restoreAfterSwipe();
+        }
+    }
+
+    private void followEditorSideSwipe(View window, MotionEvent event) {
+        View root = window.getRootView();
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            EditorSideSwipe previous = editorSideSwipes.put(root, new EditorSideSwipe(window, event));
+            if (previous != null) previous.finish();
+        } else if (action == MotionEvent.ACTION_MOVE && event.getPointerCount() == 1) {
+            EditorSideSwipe swipe = editorSideSwipes.get(root);
+            if (swipe != null) swipe.move(window, event);
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
+                || action == MotionEvent.ACTION_POINTER_DOWN) {
+            EditorSideSwipe swipe = editorSideSwipes.remove(root);
+            if (swipe != null) swipe.finish();
+        }
+    }
+
     private boolean handleOpenReplyPull(Chain chain, View window, MotionEvent event, OpenReplyTarget target)
             throws Throwable {
         if (replayingOpenReplyDown) return false;
+        followEditorSideSwipe(window, event);
         OpenReplyPull pull = openReplyPulls.get(window);
         if (event.getActionMasked() != MotionEvent.ACTION_DOWN)
             return pull != null && pull.handle(chain, event);
@@ -1630,7 +1720,7 @@ public final class ReplyModule extends XposedModule {
         private ValueAnimator rewind;
         private Runnable afterOpening;
         private ReplyBackdrop backdrop;
-        private boolean closed, opening, writingHeight;
+        private boolean closed, opening, writingHeight, sideways;
 
         BannerHeightPreview(View row, int initial, int expanded, BannerTemplateTransition templateTransition,
                 BannerReplyMotion.PullOrigin replyOrigin) {
@@ -1642,8 +1732,9 @@ public final class ReplyModule extends XposedModule {
             this.replyOrigin = replyOrigin;
         }
 
-        void follow(float distance, float start, float threshold) {
+        void follow(float distance, float start, float threshold, boolean sideways) {
             if (closed || opening || rewind != null) return;
+            this.sideways = sideways;
             // Start at zero velocity, then approach the expanded height as the finger moves.
             float preview = 0.90f * bannerProgress(distance, start, threshold);
             targetHeight = initial + (expanded - initial) * preview;
@@ -1715,7 +1806,7 @@ public final class ReplyModule extends XposedModule {
                         ? (float) (nextHeight - openingHeight) / Math.max(1, expanded - openingHeight) : 0f;
                 replyOrigin.follow(progress, nextHeight - initial, openingProgress);
             }
-            if (backdrop != null) backdrop.drag(progress);
+            if (backdrop != null && (!sideways || opening)) backdrop.drag(progress);
         }
 
         void finish(boolean committed) {
