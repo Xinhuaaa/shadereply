@@ -12,6 +12,7 @@ public final class ModuleApplication extends Application implements XposedServic
     @Override public void onCreate() {
         super.onCreate();
         XposedServiceHelper.registerListener(this);
+        AutoUpdateCheckService.ensureScheduled(this);
     }
 
     XposedService service() { return service; }

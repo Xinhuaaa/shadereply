@@ -40,6 +40,7 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
     private static final int HEADER_TEXT_SECONDARY = NotificationResources.id("header_text_secondary");
     private static final int MESSAGING_CONTENT = NotificationResources.id("notification_messaging");
     private static final int MESSAGE_LINE = NotificationResources.id("message_text");
+    private static final int MESSAGE_NAME = NotificationResources.id("message_name");
     private static final int MAX_SNAPSHOT_PIXELS = 420_000;
     private static final ArgbEvaluator COLORS = new ArgbEvaluator();
     private static final WeakHashMap<View, BannerTemplateTransition> active = new WeakHashMap<>();
@@ -47,7 +48,7 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
     private final View card;
     private final View host;
     private final float density;
-    private final Track title, message;
+    private final Track title, message, groupSender;
     private final Snapshot compactApp, expandedApp, reply;
     private final Alpha liveActions;
     private final ActionStrip actionStrip;
@@ -106,7 +107,26 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
                 latestLine = paragraph;
         }
         CharSequence latestText = first(body, text(latestLine), text(summary), extras.getCharSequence(Notification.EXTRA_TEXT));
-        message = track(latestText, summary, latestLine, compactHeight, expandedHeight, false);
+        String name = sender == null ? "" : senderName(sender.getName());
+        TextView expandedSender = extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION) && !name.isEmpty()
+                ? findGroupSender(expandedMessages, latestLine, name) : null;
+        Anchor compactSummary = anchor(summary, compactHeight);
+        Anchor expandedNameAnchor = anchor(expandedSender, expandedHeight);
+        int separator = senderPrefixEnd(text(summary), name);
+        Anchor compactBody = bodyAnchor(summary, compactSummary, separator);
+        if (expandedNameAnchor != null && compactBody != null && expandedSender != expandedTitle) {
+            CharSequence summaryText = text(summary);
+            char colon = summaryText.charAt(name.length());
+            groupSender = new Track(name, name, compactSummary, expandedNameAnchor,
+                    null, expandedSender, colon, senderColon(text(expandedSender), name));
+            CharSequence compactText = summaryText.subSequence(separator, summaryText.length());
+            Anchor expandedBody = anchor(latestLine, expandedHeight);
+            if (expandedBody == null) expandedBody = fallback(compactBody, expandedHeight, 74f, 14f, false);
+            message = new Track(latestText, compactText, compactBody, expandedBody, summary, latestLine, (char) 0, (char) 0);
+        } else {
+            groupSender = null;
+            message = track(latestText, summary, latestLine, compactHeight, expandedHeight, false);
+        }
 
         TextView compactName = textView(compact, APP_NAME), expandedName = textView(expanded, APP_NAME);
         compactApp = compactName == compactTitle ? null : snapshot(compactName);
@@ -129,6 +149,7 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
             host.getOverlay().add(this);
         }
         if (title != null) title.hide();
+        if (groupSender != null) groupSender.hide();
         if (message != null) message.hide();
         hide(compactApp);
         hide(expandedApp);
@@ -169,6 +190,7 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
         host.getOverlay().remove(this);
         card.removeOnAttachStateChangeListener(this);
         if (title != null) title.restore();
+        if (groupSender != null) groupSender.restore();
         if (message != null) message.restore();
         restore(compactApp);
         restore(expandedApp);
@@ -192,6 +214,7 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
         if (expandedApp != null) drawSnapshot(canvas, expandedApp,
                 expandedApp.bounds.top + 10f * density * (1f - arrive), arrive);
         if (title != null) title.draw(canvas, progress);
+        if (groupSender != null) groupSender.draw(canvas, progress);
         if (message != null) message.draw(canvas, progress);
         if (actionStrip != null) {
             float opacity = movingReply == null ? 1f - smooth((progress - 0.08f) / 0.37f)
@@ -240,6 +263,37 @@ final class BannerTemplateTransition extends Drawable implements View.OnAttachSt
                 view.getWidth() - view.getCompoundPaddingLeft() - view.getCompoundPaddingRight());
         if (left < 0 || width <= 0 || baseline <= 0f || baseline >= height) return null;
         return new Anchor(left, baseline, width, view.getTextSize(), view.getCurrentTextColor());
+    }
+
+    private Anchor bodyAnchor(TextView summary, Anchor anchor, int start) {
+        if (anchor == null || start <= 0) return null;
+        Layout layout = summary.getLayout();
+        if (layout == null || start >= layout.getLineEnd(0)) return null;
+        float offset = layout.getPrimaryHorizontal(start) - layout.getPrimaryHorizontal(0);
+        return offset > 0 && offset < anchor.width
+                ? new Anchor(anchor.left + offset, anchor.baseline, anchor.width - offset, anchor.size, anchor.color)
+                : null;
+    }
+
+    private static int senderPrefixEnd(CharSequence summary, String name) {
+        if (summary == null || name.isEmpty() || summary.length() <= name.length()
+                || !TextUtils.regionMatches(summary, 0, name, 0, name.length())) return -1;
+        int end = name.length();
+        char separator = summary.charAt(end);
+        if (separator != ':' && separator != '：') return -1;
+        while (++end < summary.length() && Character.isWhitespace(summary.charAt(end))) {}
+        return end < summary.length() ? end : -1;
+    }
+
+    private static TextView findGroupSender(View messages, TextView latestLine, String name) {
+        if (messages == null) return null;
+        for (View node = latestLine; node != null && node != messages;
+                node = node.getParent() instanceof View parent ? parent : null) {
+            TextView label = textView(node, MESSAGE_NAME);
+            if (label != null && name.equals(senderName(text(label)))) return label;
+        }
+        TextView label = findHeading(messages, name);
+        return label != null && label.getId() == MESSAGE_NAME ? label : null;
     }
 
     private Anchor fallback(Anchor other, int height, float baseline, float size, boolean heading) {

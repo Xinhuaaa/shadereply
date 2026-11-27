@@ -1,5 +1,6 @@
 package io.shadereply
 
+import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -9,6 +10,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
@@ -67,6 +69,7 @@ import io.github.suqi8.coui.kmp.basic.Scaffold
 import io.github.suqi8.coui.kmp.basic.Text
 import io.github.suqi8.coui.kmp.basic.TopAppBar
 import io.github.suqi8.coui.kmp.preference.ArrowPreference
+import io.github.suqi8.coui.kmp.preference.SwitchPreference
 import io.github.suqi8.coui.kmp.theme.COUITheme
 import io.github.suqi8.coui.kmp.theme.darkColorScheme
 import io.github.suqi8.coui.kmp.theme.lightColorScheme
@@ -79,6 +82,13 @@ import org.json.JSONException
 import java.io.IOException
 
 class AboutActivity : ComponentActivity() {
+    private var automaticChecks by mutableStateOf(true)
+    private var updateNotificationsEnabled by mutableStateOf(false)
+    private val updatePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        updateNotificationsEnabled = AutoUpdateCheckService.notificationsEnabled(this)
+        if (!allowed && automaticChecks) startActivity(AutoUpdateCheckService.notificationSettings(this))
+    }
+
     private sealed class Destination(val depth: Int) {
         data object Overview : Destination(0)
         data object LicenseList : Destination(1)
@@ -93,6 +103,27 @@ class AboutActivity : ComponentActivity() {
             COUITheme(colors = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 AboutPage(installedVersion)
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        automaticChecks = AutoUpdateCheckService.isEnabled(this)
+        updateNotificationsEnabled = AutoUpdateCheckService.notificationsEnabled(this)
+    }
+
+    private fun changeAutomaticChecks(enabled: Boolean) {
+        AutoUpdateCheckService.setEnabled(this, enabled)
+        automaticChecks = enabled
+        updateNotificationsEnabled = AutoUpdateCheckService.notificationsEnabled(this)
+        if (enabled && AutoUpdateCheckService.needsNotificationPermission(this)) requestUpdateNotifications()
+    }
+
+    private fun requestUpdateNotifications() {
+        if (AutoUpdateCheckService.needsNotificationPermission(this)) {
+            updatePermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            startActivity(AutoUpdateCheckService.notificationSettings(this))
         }
     }
 
@@ -207,6 +238,16 @@ class AboutActivity : ComponentActivity() {
                                 enabled = !checking,
                                 onClick = onCheck,
                             )
+                            HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                            SwitchPreference(
+                                title = "自动检查更新", checked = automaticChecks,
+                                summary = "每天检查一次，有新版本时发送通知",
+                                onCheckedChange = ::changeAutomaticChecks,
+                            )
+                            if (automaticChecks && !updateNotificationsEnabled) {
+                                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                                ArrowPreference(title = "开启更新提醒", onClick = ::requestUpdateNotifications)
+                            }
                             HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                             ArrowPreference(title = "项目主页", summary = "Xinhuaaa/shadereply",
                                 onClick = { openLink(ShadeReplyReleases.PROJECT) })

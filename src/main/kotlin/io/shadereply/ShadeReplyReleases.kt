@@ -1,5 +1,6 @@
 package io.shadereply
 
+import android.net.Network
 import org.json.JSONArray
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -28,9 +29,10 @@ internal object ShadeReplyReleases {
     private val sha256Digest = Regex("sha256:([0-9a-f]{64})")
     private val versionTag = Regex("""v?(\d+)\.(\d+)\.(\d+)""")
 
-    fun newerThan(installed: String): ShadeReplyRelease? {
+    fun newerThan(installed: String, network: Network? = null): ShadeReplyRelease? {
         val local = version(installed) ?: throw IOException("Invalid installed version")
-        val connection = URI.create(API).toURL().openConnection() as HttpURLConnection
+        val url = URI.create(API).toURL()
+        val connection = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
         val releases = try {
             connection.connectTimeout = 8000
             connection.readTimeout = 8000
